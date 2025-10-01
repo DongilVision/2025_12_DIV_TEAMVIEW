@@ -1,16 +1,22 @@
 # server_main.py
 import sys, time, socket, select, threading, struct, json, os, ctypes
+import tempfile, uuid, shutil
 import numpy as np
 import cv2
 from mss import mss
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QStandardPaths, QUrl, QMimeData
-from PySide6.QtGui import QAction, QIcon, QGuiApplication
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QUrl
+from PySide6.QtGui import QAction, QIcon, QGuiApplication, QMimeData
 from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QWidget, QVBoxLayout, QSystemTrayIcon, QMenu
 
-from common import DEFAULT_HOST, VIDEO_PORT, CONTROL_PORT, FILE_PORT, FRAME_FPS, JPEG_QUALITY, get_local_ip
+from common import (
+    DEFAULT_HOST, VIDEO_PORT, CONTROL_PORT, FILE_PORT,
+    FRAME_FPS, JPEG_QUALITY, get_local_ip
+)
 
-# ====== Windows 입력 주입 ======
+# =========================
+# Windows 입력 주입 유틸
+# =========================
 user32 = ctypes.windll.user32
 SetCursorPos   = user32.SetCursorPos
 mouse_event    = user32.mouse_event
@@ -28,7 +34,7 @@ MOUSEEVENTF_WHEEL      = 0x0800
 # 키 플래그
 KEYEVENTF_KEYUP = 0x0002
 
-# 문자열 키 fallback용 VK 사전(필요 최소)
+# 문자열 키 fallback(구버전 호환용)
 VK_FALLBACK = {
     "ESC":0x1B,"ENTER":0x0D,"BACK":0x08,"TAB":0x09,"SPACE":0x20,
     "LEFT":0x25,"UP":0x26,"RIGHT":0x27,"DOWN":0x28,
@@ -37,7 +43,11 @@ VK_FALLBACK = {
     "HANGUL":0x15,"HANJA":0x19,
 }
 
+# =========================
+# 공통 유틸
+# =========================
 def recv_exact(sock: socket.socket, n: int) -> bytes | None:
+    """정확히 n바이트를 수신(연결 끊김 시 None)."""
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -46,7 +56,25 @@ def recv_exact(sock: socket.socket, n: int) -> bytes | None:
         buf += chunk
     return bytes(buf)
 
-# ====== 영상 서버 ======
+def cleanup_old_temp_dirs(base_dir, older_than_sec=24*3600):
+    """임시 세션 폴더 청소(기본 24시간 이전)."""
+    try:
+        now = time.time()
+        if not os.path.isdir(base_dir):
+            return
+        for name in os.listdir(base_dir):
+            p = os.path.join(base_dir, name)
+            try:
+                if os.path.isdir(p) and (now - os.path.getmtime(p) > older_than_sec):
+                    shutil.rmtree(p, ignore_errors=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# =========================
+# 영상 서버
+# =========================
 class VideoServer(QThread):
     sig_conn_changed = Signal(int)
     sig_res_changed  = Signal(int, int)  # (w,h)
@@ -125,7 +153,9 @@ class VideoServer(QThread):
 
     def stop(self): self._stop.set()
 
-# ====== 제어 서버 ======
+# =========================
+# 제어 서버(마우스/키보드)
+# =========================
 class ControlServer(QThread):
     """키/마우스 제어 수신."""
     sig_ctrl_conn = Signal(bool)
@@ -195,14 +225,14 @@ class ControlServer(QThread):
             delta = int(m.get("delta", 0))
             mouse_event(MOUSEEVENTF_WHEEL, 0,0,delta,0); return
 
-        # ---- 키보드 (vk 우선) ----
+        # ---- 키보드 (vk 우선, 문자열 fallback) ----
         if t == "key":
             vk = int(m.get("vk", 0))
             down = bool(m.get("down", True))
             if vk:
                 keybd_event(vk, 0, 0 if down else KEYEVENTF_KEYUP, 0)
                 return
-            # 구버전 fallback: "key" 문자열
+            # 구 포맷: "key" 문자열
             name = m.get("key","")
             if not name: return
             if name == " ": name = "SPACE"
@@ -215,7 +245,7 @@ class ControlServer(QThread):
                 keybd_event(vk2, 0, 0 if down else KEYEVENTF_KEYUP, 0)
             return
 
-        # ---- 파일 붙여넣기 편의 ----
+        # ---- 파일 붙여넣기 편의(클립보드 파일 설정 + Ctrl+V 주입) ----
         if t == "set_clip_files":
             paths = m.get("paths", [])
             and_paste = bool(m.get("and_paste", False))
@@ -226,19 +256,23 @@ class ControlServer(QThread):
                 QGuiApplication.clipboard().setMimeData(mime)
                 if and_paste:
                     # Ctrl+V 시퀀스
-                    keybd_event(0x11,0,0,0)  # CTRL down
-                    keybd_event(0x56,0,0,0)  # 'V' down
-                    keybd_event(0x56,0,KEYEVENTF_KEYUP,0)  # 'V' up
-                    keybd_event(0x11,0,KEYEVENTF_KEYUP,0)  # CTRL up
+                    keybd_event(0x11,0,0,0)                    # CTRL down
+                    keybd_event(0x56,0,0,0)                    # 'V' down
+                    keybd_event(0x56,0,KEYEVENTF_KEYUP,0)      # 'V' up
+                    keybd_event(0x11,0,KEYEVENTF_KEYUP,0)      # CTRL up
             return
 
-# ====== 파일 서버 ======
+# =========================
+# 파일 서버 (임시 폴더 기반)
+# =========================
 class FileServer(QThread):
     """
-    업로드(클→서):  [4][json: {"cmd":"upload","files":[{"name":..., "size":...}, ...]}] + 파일 데이터
-      저장: %USERPROFILE%/Downloads/RemoteDrop
+    업로드(클→서): [4][json: {"cmd":"upload","files":[{"name":..., "size":...}, ...]}] + 파일 데이터
+      저장: %TEMP%/RemotePaste/<세션ID>/
       응답: {"ok":True, "saved_dir":..., "saved_paths":[fullpath,...]}
+
     다운로드(서→클): {"cmd":"download_clip"} 요청 시 서버 클립보드 파일 목록/본문 스트리밍
+                     (필요 시 유지. 현재 '붙여넣기' 흐름에는 필수 아님)
     """
     def __init__(self, host: str, port: int):
         super().__init__()
@@ -284,15 +318,18 @@ class FileServer(QThread):
 
     def _handle_upload(self, sock, req):
         files = req.get("files", [])
-        base_dir = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or os.path.expanduser("~/Downloads")
-        save_dir = os.path.join(base_dir, "RemoteDrop")
-        os.makedirs(save_dir, exist_ok=True)
+
+        # %TEMP%/RemotePaste/<세션ID>/
+        temp_root = os.path.join(tempfile.gettempdir(), "RemotePaste")
+        os.makedirs(temp_root, exist_ok=True)
+        session_dir = os.path.join(temp_root, str(uuid.uuid4())[:8])
+        os.makedirs(session_dir, exist_ok=True)
 
         saved_paths = []
         for meta in files:
             name = os.path.basename(meta.get("name","file"))
             size = int(meta.get("size", 0))
-            dst  = os.path.join(save_dir, name)
+            dst  = os.path.join(session_dir, name)
             with open(dst, "wb") as f:
                 remain = size
                 while remain > 0:
@@ -301,7 +338,11 @@ class FileServer(QThread):
                     f.write(chunk); remain -= len(chunk)
             saved_paths.append(dst)
 
-        ack = json.dumps({"ok": True, "saved_dir": save_dir, "saved_paths": saved_paths}).encode("utf-8")
+        ack = json.dumps({
+            "ok": True,
+            "saved_dir": session_dir,
+            "saved_paths": saved_paths
+        }).encode("utf-8")
         sock.sendall(struct.pack(">I", len(ack)) + ack)
 
     def _handle_download_clip(self, sock):
@@ -327,7 +368,9 @@ class FileServer(QThread):
                     if not buf: break
                     sock.sendall(buf)
 
-# ====== 서버 윈도우 ======
+# =========================
+# 서버 윈도우
+# =========================
 class ServerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -336,6 +379,12 @@ class ServerWindow(QMainWindow):
         self.start_ts = time.time()
         self.ip = get_local_ip()
 
+        # 임시 세션 루트 초기화 및 청소
+        self.temp_root = os.path.join(tempfile.gettempdir(), "RemotePaste")
+        os.makedirs(self.temp_root, exist_ok=True)
+        cleanup_old_temp_dirs(self.temp_root)
+
+        # 스레드 준비
         self.video = VideoServer(DEFAULT_HOST, VIDEO_PORT)
         self.ctrl  = ControlServer(DEFAULT_HOST, CONTROL_PORT)
         self.files = FileServer(DEFAULT_HOST, FILE_PORT)
@@ -343,7 +392,11 @@ class ServerWindow(QMainWindow):
         self.video.sig_res_changed.connect(self.on_res)
         self.ctrl.sig_ctrl_conn.connect(self.on_ctrl_conn)
 
-        self.lbl_ip = QLabel(f"서버 IP: {self.ip}  V:{VIDEO_PORT} / C:{CONTROL_PORT} / F:{FILE_PORT}", alignment=Qt.AlignCenter)
+        # UI
+        self.lbl_ip = QLabel(
+            f"서버 IP: {self.ip}  V:{VIDEO_PORT} / C:{CONTROL_PORT} / F:{FILE_PORT}",
+            alignment=Qt.AlignCenter
+        )
         self.lbl_res = QLabel("원격 해상도: - x -", alignment=Qt.AlignCenter)
         self.lbl_uptime = QLabel("연결 시간: 00:00:00", alignment=Qt.AlignCenter)
         self.lbl_conns = QLabel("영상 연결 수: 0 | 제어 연결: -", alignment=Qt.AlignCenter)
@@ -393,6 +446,9 @@ class ServerWindow(QMainWindow):
         self.files.stop(); self.files.wait(1500)
         super().closeEvent(e)
 
+# =========================
+# 엔트리 포인트
+# =========================
 def main():
     app = QApplication(sys.argv)
     w = ServerWindow(); w.show()
