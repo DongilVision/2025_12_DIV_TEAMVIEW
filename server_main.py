@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QWidget, QVBoxL
 
 from common import DEFAULT_HOST, VIDEO_PORT, CONTROL_PORT, FILE_PORT, FRAME_FPS, JPEG_QUALITY, get_local_ip
 
-# ====== Windows 입력 주입 유틸 ======
+# ====== Windows 입력 주입 ======
 user32 = ctypes.windll.user32
 SetCursorPos   = user32.SetCursorPos
 mouse_event    = user32.mouse_event
@@ -25,36 +25,18 @@ MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP   = 0x0040
 MOUSEEVENTF_WHEEL      = 0x0800
 
-# 키 플래그 / VK
+# 키 플래그
 KEYEVENTF_KEYUP = 0x0002
-VK_CONTROL = 0x11
 
-# 기존 VK 사전 아래에 추가/보강
-VK = {
-    "ESC": 0x1B, "ENTER": 0x0D, "BACK": 0x08, "TAB": 0x09,
-    "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28,
-    "SPACE": 0x20, "DELETE": 0x2E, "HOME": 0x24, "END": 0x23,
-    "PGUP": 0x21, "PGDN": 0x22,
-    # ★ 추가
-    "SHIFT": 0x10,     # VK_SHIFT
-    "CTRL": 0x11,      # VK_CONTROL
-    "ALT": 0x12,       # VK_MENU
+# 문자열 키 fallback용 VK 사전(필요 최소)
+VK_FALLBACK = {
+    "ESC":0x1B,"ENTER":0x0D,"BACK":0x08,"TAB":0x09,"SPACE":0x20,
+    "LEFT":0x25,"UP":0x26,"RIGHT":0x27,"DOWN":0x28,
+    "DELETE":0x2E,"HOME":0x24,"END":0x23,"PGUP":0x21,"PGDN":0x22,
+    "SHIFT":0x10,"CTRL":0x11,"ALT":0x12,"WIN":0x5B,
+    "HANGUL":0x15,"HANJA":0x19,
 }
 
-def to_vk(key: str) -> int:
-    if not key:
-        return 0
-    # ★ 공백을 SPACE로 정규화
-    if key == " ":
-        key = "SPACE"
-    up = key.upper()
-    # 알파벳/숫자
-    if len(up) == 1 and ("A" <= up <= "Z" or "0" <= up <= "9"):
-        return ord(up)
-    # 사전 매핑
-    return VK.get(up, 0)
-
-# ====== 공통 유틸 ======
 def recv_exact(sock: socket.socket, n: int) -> bytes | None:
     buf = bytearray()
     while len(buf) < n:
@@ -145,7 +127,7 @@ class VideoServer(QThread):
 
 # ====== 제어 서버 ======
 class ControlServer(QThread):
-    """JSON 길이프리픽스 기반. 접속마다 핸들러 스레드 생성(블로킹)."""
+    """키/마우스 제어 수신."""
     sig_ctrl_conn = Signal(bool)
 
     def __init__(self, host: str, port: int):
@@ -190,40 +172,51 @@ class ControlServer(QThread):
             except: pass
             self.sig_ctrl_conn.emit(False)
 
-    # 실제 입력 주입 + 특별 동작
     def _handle_msg(self, m: dict):
         t = m.get("t")
 
+        # ---- 마우스 ----
         if t == "mouse_move":
             x = int(m.get("x", 0)); y = int(m.get("y", 0))
-            SetCursorPos(x, y)
-
-        elif t == "mouse_down":
+            SetCursorPos(x, y); return
+        if t == "mouse_down":
             btn = m.get("btn","left")
             if btn=="left":  mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0)
             elif btn=="right": mouse_event(MOUSEEVENTF_RIGHTDOWN,0,0,0,0)
             elif btn=="middle":mouse_event(MOUSEEVENTF_MIDDLEDOWN,0,0,0,0)
-
-        elif t == "mouse_up":
+            return
+        if t == "mouse_up":
             btn = m.get("btn","left")
             if btn=="left":  mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0)
             elif btn=="right": mouse_event(MOUSEEVENTF_RIGHTUP,0,0,0,0)
             elif btn=="middle":mouse_event(MOUSEEVENTF_MIDDLEUP,0,0,0,0)
-
-        elif t == "mouse_wheel":
+            return
+        if t == "mouse_wheel":
             delta = int(m.get("delta", 0))
-            mouse_event(MOUSEEVENTF_WHEEL, 0,0,delta,0)
+            mouse_event(MOUSEEVENTF_WHEEL, 0,0,delta,0); return
 
-        elif t == "key_down":
-            vk = to_vk(m.get("key",""))
-            if vk: keybd_event(vk, 0, 0, 0)
+        # ---- 키보드 (vk 우선) ----
+        if t == "key":
+            vk = int(m.get("vk", 0))
+            down = bool(m.get("down", True))
+            if vk:
+                keybd_event(vk, 0, 0 if down else KEYEVENTF_KEYUP, 0)
+                return
+            # 구버전 fallback: "key" 문자열
+            name = m.get("key","")
+            if not name: return
+            if name == " ": name = "SPACE"
+            up = name.upper()
+            if len(up) == 1 and ("A"<=up<="Z" or "0"<=up<="9"):
+                keybd_event(ord(up), 0, 0 if down else KEYEVENTF_KEYUP, 0)
+                return
+            vk2 = VK_FALLBACK.get(up, 0)
+            if vk2:
+                keybd_event(vk2, 0, 0 if down else KEYEVENTF_KEYUP, 0)
+            return
 
-        elif t == "key_up":
-            vk = to_vk(m.get("key",""))
-            if vk: keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-
-        elif t == "set_clip_files":
-            # 서버 클립보드에 파일 경로(CF_HDROP) 설정 후, 원하면 Ctrl+V 도 주입
+        # ---- 파일 붙여넣기 편의 ----
+        if t == "set_clip_files":
             paths = m.get("paths", [])
             and_paste = bool(m.get("and_paste", False))
             if paths:
@@ -233,21 +226,19 @@ class ControlServer(QThread):
                 QGuiApplication.clipboard().setMimeData(mime)
                 if and_paste:
                     # Ctrl+V 시퀀스
-                    keybd_event(VK_CONTROL, 0, 0, 0)
-                    keybd_event(ord('V'), 0, 0, 0)
-                    keybd_event(ord('V'), 0, KEYEVENTF_KEYUP, 0)
-                    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+                    keybd_event(0x11,0,0,0)  # CTRL down
+                    keybd_event(0x56,0,0,0)  # 'V' down
+                    keybd_event(0x56,0,KEYEVENTF_KEYUP,0)  # 'V' up
+                    keybd_event(0x11,0,KEYEVENTF_KEYUP,0)  # CTRL up
+            return
 
 # ====== 파일 서버 ======
 class FileServer(QThread):
     """
     업로드(클→서):  [4][json: {"cmd":"upload","files":[{"name":..., "size":...}, ...]}] + 파일 데이터
-      저장 경로: %USERPROFILE%/Downloads/RemoteDrop
+      저장: %USERPROFILE%/Downloads/RemoteDrop
       응답: {"ok":True, "saved_dir":..., "saved_paths":[fullpath,...]}
-
-    다운로드(서→클): 클립보드 파일 리스트 및 본문 스트리밍
-      요청: {"cmd":"download_clip"}
-      응답 헤더: {"cmd":"download_clip","files":[{"name":..., "size":...}, ...]}
+    다운로드(서→클): {"cmd":"download_clip"} 요청 시 서버 클립보드 파일 목록/본문 스트리밍
     """
     def __init__(self, host: str, port: int):
         super().__init__()
@@ -317,10 +308,7 @@ class FileServer(QThread):
         cb = QGuiApplication.clipboard()
         md = cb.mimeData()
         urls = md.urls() if md else []
-        paths = []
-        for u in urls:
-            if u.isLocalFile():
-                paths.append(u.toLocalFile())
+        paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
 
         metas = []
         for p in paths:

@@ -24,6 +24,120 @@ def recv_exact(sock: socket.socket, n: int) -> bytes | None:
         buf += chunk
     return bytes(buf)
 
+# ---- Qt Key -> Windows VK 매핑 ----
+VK = {
+    # 기능키
+    "F1":0x70,"F2":0x71,"F3":0x72,"F4":0x73,"F5":0x74,"F6":0x75,"F7":0x76,"F8":0x77,
+    "F9":0x78,"F10":0x79,"F11":0x7A,"F12":0x7B,"F13":0x7C,"F14":0x7D,"F15":0x7E,"F16":0x7F,
+    "F17":0x80,"F18":0x81,"F19":0x82,"F20":0x83,"F21":0x84,"F22":0x85,"F23":0x86,"F24":0x87,
+    # 편집/내비
+    "ESC":0x1B,"TAB":0x09,"ENTER":0x0D,"BACK":0x08,"SPACE":0x20,
+    "LEFT":0x25,"UP":0x26,"RIGHT":0x27,"DOWN":0x28,
+    "INSERT":0x2D,"DELETE":0x2E,"HOME":0x24,"END":0x23,"PGUP":0x21,"PGDN":0x22,
+    "CAPSLOCK":0x14,"NUMLOCK":0x90,"SCROLLLOCK":0x91,"PRINT":0x2C,"PAUSE":0x13,
+    # 수정키/윈키
+    "SHIFT":0x10,"CTRL":0x11,"ALT":0x12,"WIN":0x5B,"RWIN":0x5C,"APPS":0x5D,  # 컨텍스트 메뉴
+    # 한글
+    "HANGUL":0x15,"HANJA":0x19,
+    # 넘패드
+    "NP0":0x60,"NP1":0x61,"NP2":0x62,"NP3":0x63,"NP4":0x64,"NP5":0x65,"NP6":0x66,"NP7":0x67,"NP8":0x68,"NP9":0x69,
+    "NP_MUL":0x6A,"NP_ADD":0x6B,"NP_SEP":0x6C,"NP_SUB":0x6D,"NP_DEC":0x6E,"NP_DIV":0x6F,
+    # OEM 기호키(미국 배열 기준)
+    "OEM_1":0xBA,   # ;:
+    "OEM_PLUS":0xBB,# =+
+    "OEM_COMMA":0xBC,# ,<
+    "OEM_MINUS":0xBD,# -_
+    "OEM_PERIOD":0xBE,# .>
+    "OEM_2":0xBF,   # /?
+    "OEM_3":0xC0,   # `~
+    "OEM_4":0xDB,   # [{
+    "OEM_5":0xDC,   # \|
+    "OEM_6":0xDD,   # ]}
+    "OEM_7":0xDE,   # '"
+}
+
+def qt_to_vk(e) -> int:
+    k = e.key()
+    mods = e.modifiers()
+
+    # 수정키/특수키 우선
+    if k == Qt.Key_Control: return VK["CTRL"]
+    if k == Qt.Key_Shift:   return VK["SHIFT"]
+    if k == Qt.Key_Alt:     return VK["ALT"]
+    if k == Qt.Key_Meta:    return VK["WIN"]
+
+    if k == Qt.Key_Space:   return VK["SPACE"]
+    if k == Qt.Key_Tab:     return VK["TAB"]
+    if k in (Qt.Key_Return, Qt.Key_Enter): return VK["ENTER"]
+    if k == Qt.Key_Backspace: return VK["BACK"]
+    if k == Qt.Key_Escape:    return VK["ESC"]
+
+    # 방향/편집
+    if k == Qt.Key_Left:   return VK["LEFT"]
+    if k == Qt.Key_Right:  return VK["RIGHT"]
+    if k == Qt.Key_Up:     return VK["UP"]
+    if k == Qt.Key_Down:   return VK["DOWN"]
+    if k == Qt.Key_Insert: return VK["INSERT"]
+    if k == Qt.Key_Delete: return VK["DELETE"]
+    if k == Qt.Key_Home:   return VK["HOME"]
+    if k == Qt.Key_End:    return VK["END"]
+    if k == Qt.Key_PageUp:   return VK["PGUP"]
+    if k == Qt.Key_PageDown: return VK["PGDN"]
+    if k == Qt.Key_CapsLock:  return VK["CAPSLOCK"]
+    if k == Qt.Key_NumLock:   return VK["NUMLOCK"]
+    if k == Qt.Key_ScrollLock:return VK["SCROLLLOCK"]
+    if k == Qt.Key_Print:     return VK["PRINT"]
+    if k == Qt.Key_Pause:     return VK["PAUSE"]
+    if k == Qt.Key_Menu:      return VK["APPS"]
+    if k == Qt.Key_Hangul:    return VK["HANGUL"]
+    if k == Qt.Key_Hangul_Hanja: return VK["HANJA"]
+
+    # 기능키
+    if Qt.Key_F1 <= k <= Qt.Key_F24:
+        return VK["F"+str(k - Qt.Key_F1 + 1)]
+
+    # 넘패드: KeypadModifier가 세트일 경우 우선 매핑
+    if (mods & Qt.KeypadModifier):
+        if k == Qt.Key_0: return VK["NP0"]
+        if k == Qt.Key_1: return VK["NP1"]
+        if k == Qt.Key_2: return VK["NP2"]
+        if k == Qt.Key_3: return VK["NP3"]
+        if k == Qt.Key_4: return VK["NP4"]
+        if k == Qt.Key_5: return VK["NP5"]
+        if k == Qt.Key_6: return VK["NP6"]
+        if k == Qt.Key_7: return VK["NP7"]
+        if k == Qt.Key_8: return VK["NP8"]
+        if k == Qt.Key_9: return VK["NP9"]
+        if k == Qt.Key_Asterisk: return VK["NP_MUL"]
+        if k == Qt.Key_Plus:     return VK["NP_ADD"]
+        if k == Qt.Key_Minus:    return VK["NP_SUB"]
+        if k == Qt.Key_Slash:    return VK["NP_DIV"]
+        if k == Qt.Key_Period:   return VK["NP_DEC"]
+        # Enter는 넘패드일 수도 있으나 VK_RETURN으로 충분
+        if k in (Qt.Key_Return, Qt.Key_Enter): return VK["ENTER"]
+
+    # 상단 숫자/영문
+    if Qt.Key_0 <= k <= Qt.Key_9:
+        return ord(str(k - Qt.Key_0))
+    if Qt.Key_A <= k <= Qt.Key_Z:
+        # 대소문자와 무관하게 VK는 동일
+        return ord(chr(k))
+
+    # OEM 기호키 (미국 배열 기준: 다른 레이아웃은 OS에서 조합 처리)
+    if k == Qt.Key_Semicolon: return VK["OEM_1"]       # ;:
+    if k == Qt.Key_Equal:     return VK["OEM_PLUS"]    # =+
+    if k == Qt.Key_Comma:     return VK["OEM_COMMA"]   # ,<
+    if k == Qt.Key_Minus:     return VK["OEM_MINUS"]   # -_
+    if k == Qt.Key_Period:    return VK["OEM_PERIOD"]  # .>
+    if k == Qt.Key_Slash:     return VK["OEM_2"]       # /?
+    if k == Qt.Key_QuoteLeft: return VK["OEM_3"]       # `~
+    if k == Qt.Key_BracketLeft:  return VK["OEM_4"]    # [{
+    if k == Qt.Key_Backslash:    return VK["OEM_5"]    # \|
+    if k == Qt.Key_BracketRight: return VK["OEM_6"]    # ]}
+    if k == Qt.Key_Apostrophe:   return VK["OEM_7"]    # '"
+
+    return 0  # 미지원/미매핑
+
 # ---- 영상 수신 ----
 class VideoClient(QThread):
     sig_status = Signal(float, int, bool)   # (fps, elapsed_sec, connected)
@@ -95,7 +209,7 @@ class ControlClient:
         except Exception:
             self.sock = None
 
-    def send(self, obj:dict):
+    def send_json(self, obj:dict):
         if not self.sock:
             self.connect()
             if not self.sock: return
@@ -107,6 +221,15 @@ class ControlClient:
             try: self.sock.close()
             except: pass
             self.sock = None
+
+    # 새 포맷: {"t":"key","vk":int,"down":bool}
+    def send_key(self, vk:int, down:bool):
+        if vk:
+            self.send_json({"t":"key","vk":int(vk),"down":bool(down)})
+
+    # 구 포맷(문자열) 필요 시:
+    def send_key_legacy(self, name:str, down:bool):
+        self.send_json({"t":"key","key":name,"down":bool(down)})
 
 # ---- 파일 클라이언트 ----
 class FileClient:
@@ -120,7 +243,7 @@ class FileClient:
         return s
 
     def upload_clipboard_files_and_get_server_paths(self):
-        """로컬 클립보드 파일을 업로드하고 서버 측 저장 fullpath 목록을 돌려받습니다."""
+        """로컬 클립보드 파일을 업로드하고 서버 측 저장 fullpath 목록을 반환."""
         cb = QGuiApplication.clipboard()
         md = cb.mimeData()
         urls = md.urls() if md else []
@@ -174,7 +297,7 @@ class TopStatusBar(QFrame):
     def update_fps(self, fps:float): self.lbl_fps.setText(f"FPS {int(fps)}")
     def update_ip(self, ip_text:str): self.lbl_ip.setText(f"서버: {ip_text}")
 
-# ---- 원격 뷰 라벨 (입력 이벤트 포착/좌표 매핑) ----
+# ---- 원격 뷰 라벨 ----
 class ViewerLabel(QLabel):
     sig_mouse = Signal(dict)
     def __init__(self, parent=None):
@@ -207,7 +330,6 @@ class ViewerLabel(QLabel):
         rx = max(0, min(rx, rw-1)); ry = max(0, min(ry, rh-1))
         return (rx, ry)
 
-    # 마우스 이벤트
     def mouseMoveEvent(self, e):  self.sig_mouse.emit({"t":"move","x":e.position().x(),"y":e.position().y()})
     def mousePressEvent(self, e):
         btn = "left" if e.button()==Qt.LeftButton else "right" if e.button()==Qt.RightButton else "middle"
@@ -255,9 +377,6 @@ class ClientWindow(QMainWindow):
         self.view.setFocusPolicy(Qt.StrongFocus)
         self.btn_keep.clicked.connect(self.on_keep_toggle)
 
-        # 키 조합 상태
-        self._ctrl_pressed = False
-
     # 상태/프레임
     def on_status(self, fps:float, elapsed:int, connected:bool):
         self.topbar.update_fps(fps); self.topbar.update_time(elapsed if connected else 0)
@@ -285,65 +404,38 @@ class ClientWindow(QMainWindow):
         rx, ry = self.view.map_to_remote(cursor)
         t = ev.get("t")
         if t == "move":
-            self.cc.send({"t":"mouse_move", "x":rx, "y":ry})
+            self.cc.send_json({"t":"mouse_move", "x":rx, "y":ry})
         elif t == "down":
-            self.cc.send({"t":"mouse_move", "x":rx, "y":ry})
-            self.cc.send({"t":"mouse_down", "btn": ev.get("btn","left")})
+            self.cc.send_json({"t":"mouse_move", "x":rx, "y":ry})
+            self.cc.send_json({"t":"mouse_down", "btn": ev.get("btn","left")})
         elif t == "up":
-            self.cc.send({"t":"mouse_up", "btn": ev.get("btn","left")})
+            self.cc.send_json({"t":"mouse_up", "btn": ev.get("btn","left")})
         elif t == "wheel":
-            self.cc.send({"t":"mouse_wheel", "delta": int(ev.get("delta",0))})
+            self.cc.send_json({"t":"mouse_wheel", "delta": int(ev.get("delta",0))})
 
     def keyPressEvent(self, e):
-        key_name = self._qtkey_to_str(e)
+        if e.isAutoRepeat():
+            return  # 자동반복 down 억제(붙힘 방지). 필요 시 제거 가능.
 
-        # ★ Ctrl+V 특수 처리 (클립보드에 파일이 있을 때만 가로채기)
-        if key_name == "V" and (e.modifiers() & Qt.ControlModifier):
-            ok, msg, server_paths = self.fc.upload_clipboard_files_and_get_server_paths()
+        # Ctrl+V 특수 처리: 클립보드에 파일이 있으면 가로채기
+        if (e.modifiers() & Qt.ControlModifier) and e.key() in (Qt.Key_V,):
+            ok, _msg, server_paths = self.fc.upload_clipboard_files_and_get_server_paths()
             if ok and server_paths:
-                self.cc.send({"t": "set_clip_files", "paths": server_paths, "and_paste": True})
+                self.cc.send_json({"t":"set_clip_files", "paths": server_paths, "and_paste": True})
                 self.statusBar().showMessage("파일 업로드 후 원격에 붙여넣었습니다.", 4000)
-                return  # Ctrl+V 이벤트 소비 (중복 전송 방지)
-            # 파일이 없으면 일반 키 전송으로 계속 진행
+                return  # V down은 소비 (서버에서 Ctrl+V를 자동 주입함)
 
-        # ★ 일반 처리: 수정키/스페이스 포함 모든 키 down 전송
-        if key_name:
-            self.cc.send({"t": "key_down", "key": key_name})
+        vk = qt_to_vk(e)
+        if vk:
+            self.cc.send_key(vk, True)
 
     def keyReleaseEvent(self, e):
-        key_name = self._qtkey_to_str(e)
+        if e.isAutoRepeat():
+            return  # 자동반복 up 억제
 
-        # ★ Ctrl+V 특수 경로를 타지 않았다면 up도 전송
-        if key_name:
-            self.cc.send({"t": "key_up", "key": key_name})
-
-
-    def _send_key(self, typ, ch):
-        self.cc.send({"t": typ, "key": ch})
-
-    def _qtkey_to_str(self, e) -> str:
-        k = e.key()
-        # ★ 스페이스/수정키 우선 처리
-        if k == Qt.Key_Space:
-            return "SPACE"
-        if k == Qt.Key_Control:
-            return "CTRL"
-        if k == Qt.Key_Shift:
-            return "SHIFT"
-        if k == Qt.Key_Alt:
-            return "ALT"
-
-        if 0x20 <= k <= 0x7E:
-            return chr(k)  # 영문/숫자/기타 ASCII
-        mapping = {
-            Qt.Key_Escape:"ESC", Qt.Key_Return:"ENTER", Qt.Key_Enter:"ENTER",
-            Qt.Key_Backspace:"BACK", Qt.Key_Tab:"TAB",
-            Qt.Key_Left:"LEFT", Qt.Key_Right:"RIGHT", Qt.Key_Up:"UP", Qt.Key_Down:"DOWN",
-            Qt.Key_Delete:"DELETE", Qt.Key_Home:"HOME", Qt.Key_End:"END",
-            Qt.Key_PageUp:"PGUP", Qt.Key_PageDown:"PGDN",
-        }
-        return mapping.get(k, "")
-
+        vk = qt_to_vk(e)
+        if vk:
+            self.cc.send_key(vk, False)
 
     # 기타
     def on_keep_toggle(self, checked:bool):
