@@ -29,17 +29,30 @@ MOUSEEVENTF_WHEEL      = 0x0800
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 
+# 기존 VK 사전 아래에 추가/보강
 VK = {
     "ESC": 0x1B, "ENTER": 0x0D, "BACK": 0x08, "TAB": 0x09,
     "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28,
-    "SPACE": 0x20, "DELETE": 0x2E, "HOME":0x24, "END":0x23, "PGUP":0x21, "PGDN":0x22,
+    "SPACE": 0x20, "DELETE": 0x2E, "HOME": 0x24, "END": 0x23,
+    "PGUP": 0x21, "PGDN": 0x22,
+    # ★ 추가
+    "SHIFT": 0x10,     # VK_SHIFT
+    "CTRL": 0x11,      # VK_CONTROL
+    "ALT": 0x12,       # VK_MENU
 }
+
 def to_vk(key: str) -> int:
-    if len(key) == 1:
-        ch = key.upper()
-        if "A" <= ch <= "Z": return ord(ch)
-        if "0" <= ch <= "9": return ord(ch)
-    return VK.get(key.upper(), 0)
+    if not key:
+        return 0
+    # ★ 공백을 SPACE로 정규화
+    if key == " ":
+        key = "SPACE"
+    up = key.upper()
+    # 알파벳/숫자
+    if len(up) == 1 and ("A" <= up <= "Z" or "0" <= up <= "9"):
+        return ord(up)
+    # 사전 매핑
+    return VK.get(up, 0)
 
 # ====== 공통 유틸 ======
 def recv_exact(sock: socket.socket, n: int) -> bytes | None:

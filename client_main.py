@@ -295,49 +295,55 @@ class ClientWindow(QMainWindow):
             self.cc.send({"t":"mouse_wheel", "delta": int(ev.get("delta",0))})
 
     def keyPressEvent(self, e):
-        if e.key() in (Qt.Key_Control,):
-            self._ctrl_pressed = True
+        key_name = self._qtkey_to_str(e)
 
-        # ★ Ctrl+V 가 눌렸고, 로컬 클립보드에 파일이 있으면 "가로채서" 파일 업로드 후 원격 붙여넣기 수행
-        if self._ctrl_pressed and e.key() == Qt.Key_V:
+        # ★ Ctrl+V 특수 처리 (클립보드에 파일이 있을 때만 가로채기)
+        if key_name == "V" and (e.modifiers() & Qt.ControlModifier):
             ok, msg, server_paths = self.fc.upload_clipboard_files_and_get_server_paths()
             if ok and server_paths:
-                # 서버 클립보드에 파일 목록 설정 + 자동 Ctrl+V 주입
-                self.cc.send({"t":"set_clip_files", "paths": server_paths, "and_paste": True})
+                self.cc.send({"t": "set_clip_files", "paths": server_paths, "and_paste": True})
                 self.statusBar().showMessage("파일 업로드 후 원격에 붙여넣었습니다.", 4000)
-            else:
-                # 파일이 없으면 일반 Ctrl+V 전달
-                self._send_key("key_down", "V")
-            return  # 여기서 종료하여 중복 전달 방지
+                return  # Ctrl+V 이벤트 소비 (중복 전송 방지)
+            # 파일이 없으면 일반 키 전송으로 계속 진행
 
-        # 일반 키는 그대로 전달
-        key = self._qtkey_to_str(e)
-        if key: self.cc.send({"t":"key_down", "key":key})
+        # ★ 일반 처리: 수정키/스페이스 포함 모든 키 down 전송
+        if key_name:
+            self.cc.send({"t": "key_down", "key": key_name})
 
     def keyReleaseEvent(self, e):
-        if e.key() in (Qt.Key_Control,):
-            self._ctrl_pressed = False
-        # Ctrl+V의 경우 업로드 경로를 탔으면 key_up은 굳이 보낼 필요 없음
-        if self._ctrl_pressed and e.key() == Qt.Key_V:
-            return
-        key = self._qtkey_to_str(e)
-        if key: self.cc.send({"t":"key_up", "key":key})
+        key_name = self._qtkey_to_str(e)
+
+        # ★ Ctrl+V 특수 경로를 타지 않았다면 up도 전송
+        if key_name:
+            self.cc.send({"t": "key_up", "key": key_name})
+
 
     def _send_key(self, typ, ch):
         self.cc.send({"t": typ, "key": ch})
 
     def _qtkey_to_str(self, e) -> str:
         k = e.key()
+        # ★ 스페이스/수정키 우선 처리
+        if k == Qt.Key_Space:
+            return "SPACE"
+        if k == Qt.Key_Control:
+            return "CTRL"
+        if k == Qt.Key_Shift:
+            return "SHIFT"
+        if k == Qt.Key_Alt:
+            return "ALT"
+
         if 0x20 <= k <= 0x7E:
-            return chr(k)
+            return chr(k)  # 영문/숫자/기타 ASCII
         mapping = {
             Qt.Key_Escape:"ESC", Qt.Key_Return:"ENTER", Qt.Key_Enter:"ENTER",
-            Qt.Key_Backspace:"BACK", Qt.Key_Tab:"TAB", Qt.Key_Space:"SPACE",
+            Qt.Key_Backspace:"BACK", Qt.Key_Tab:"TAB",
             Qt.Key_Left:"LEFT", Qt.Key_Right:"RIGHT", Qt.Key_Up:"UP", Qt.Key_Down:"DOWN",
             Qt.Key_Delete:"DELETE", Qt.Key_Home:"HOME", Qt.Key_End:"END",
             Qt.Key_PageUp:"PGUP", Qt.Key_PageDown:"PGDN",
         }
         return mapping.get(k, "")
+
 
     # 기타
     def on_keep_toggle(self, checked:bool):
