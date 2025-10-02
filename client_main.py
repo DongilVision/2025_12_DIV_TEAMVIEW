@@ -1,5 +1,5 @@
 # client_main.py
-import sys, time, socket, struct, json, os
+import sys, time, socket, struct, json, os, tempfile, zipfile
 import numpy as np
 import cv2
 
@@ -8,7 +8,7 @@ from PySide6.QtGui import QImage, QPixmap, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QPushButton, QFrame, QLineEdit, QMessageBox, QListWidget, QListWidgetItem,
-    QSplitter
+    QSplitter, QProgressBar
 )
 
 from common import VIDEO_PORT, CONTROL_PORT, FILE_PORT
@@ -32,7 +32,7 @@ def send_json(sock: socket.socket, obj: dict):
     raw = json.dumps(obj).encode("utf-8")
     sock.sendall(struct.pack(">I", len(raw)) + raw)
 
-# ===== Qt Key -> Windows VK 매핑(요지) =====
+# ===== Qt Key -> Windows VK =====
 VK = {
     "F1":0x70,"F2":0x71,"F3":0x72,"F4":0x73,"F5":0x74,"F6":0x75,"F7":0x76,"F8":0x77,
     "F9":0x78,"F10":0x79,"F11":0x7A,"F12":0x7B,"F13":0x7C,"F14":0x7D,"F15":0x7E,"F16":0x7F,
@@ -199,6 +199,7 @@ class FileClient:
         s.settimeout(5.0); s.connect((self.host, self.port)); s.settimeout(None)
         return s
 
+    # --- 서버 디렉토리 목록 ---
     def list_dir_server(self, path:str|None=None):
         s = self._connect()
         try:
@@ -209,12 +210,14 @@ class FileClient:
         finally:
             s.close()
 
-    def upload_to_dir(self, target_dir:str, local_paths:list[str]):
+    # --- 로컬→서버 업로드 (파일 여러 개) ---
+    def upload_to_dir(self, target_dir:str, local_paths:list[str], progress=None):
         metas = []
         for p in local_paths:
             if os.path.isfile(p):
                 metas.append({"name": os.path.basename(p), "size": int(os.path.getsize(p)), "path": p})
-        if not metas: return {"ok": False, "error":"no valid files"}
+        if not metas: return (False, "no valid files")
+        total = sum(m["size"] for m in metas); done = 0
         s = self._connect()
         try:
             head = {"cmd":"upload_to","target_dir":target_dir,"files":[{"name":m["name"],"size":m["size"]} for m in metas]}
@@ -225,21 +228,60 @@ class FileClient:
                         buf = f.read(1024*256)
                         if not buf: break
                         s.sendall(buf)
+                        done += len(buf)
+                        if progress: progress(done, total)
             jlen = struct.unpack(">I", recv_exact(s,4))[0]
-            return json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            ack = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            return (bool(ack.get("ok")), "OK" if ack.get("ok") else ack.get("error",""))
         finally:
             s.close()
 
-    def download_paths(self, server_paths:list[str], local_target_dir:str):
+    # --- 로컬→서버 업로드 (트리: 파일/폴더 혼합) ---
+    def upload_tree_to(self, target_dir:str, local_paths:list[str], progress=None):
+        entries = []
+        for p in local_paths:
+            p = os.path.abspath(p)
+            if os.path.isfile(p):
+                entries.append({"rel": os.path.basename(p), "size": int(os.path.getsize(p)), "src": p})
+            elif os.path.isdir(p):
+                base = os.path.basename(p.rstrip("\\/")) or p
+                for root, _dirs, fnames in os.walk(p):
+                    for fn in fnames:
+                        fp = os.path.join(root, fn)
+                        rel_sub = os.path.relpath(fp, p)
+                        rel = os.path.join(base, rel_sub)
+                        entries.append({"rel": rel, "size": int(os.path.getsize(fp)), "src": fp})
+        if not entries: return (False, "no files")
+        total = sum(e["size"] for e in entries); done = 0
+        s = self._connect()
+        try:
+            head = {"cmd":"upload_tree_to","target_dir":target_dir,"files":[{"rel":e["rel"],"size":e["size"]} for e in entries]}
+            send_json(s, head)
+            for e in entries:
+                with open(e["src"], "rb") as f:
+                    while True:
+                        buf = f.read(1024*256)
+                        if not buf: break
+                        s.sendall(buf)
+                        done += len(buf)
+                        if progress: progress(done, total)
+            jlen = struct.unpack(">I", recv_exact(s,4))[0]
+            ack = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            return (bool(ack.get("ok")), "OK" if ack.get("ok") else ack.get("error",""))
+        finally:
+            s.close()
+
+    # --- 서버→로컬 다운로드 (파일만) ---
+    def download_paths(self, server_paths:list[str], local_target_dir:str, progress=None):
         os.makedirs(local_target_dir, exist_ok=True)
         s = self._connect()
         try:
             send_json(s, {"cmd":"download_paths","paths": server_paths})
             jlen = struct.unpack(">I", recv_exact(s,4))[0]
             head = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
-            if not head.get("ok"): return head
+            if not head.get("ok"): return (False, head.get("error",""))
             files = head.get("files", [])
-            saved = []
+            total = sum(int(m["size"]) for m in files); done = 0
             for m in files:
                 name = os.path.basename(m["name"])
                 size = int(m["size"])
@@ -249,11 +291,96 @@ class FileClient:
                     while remain > 0:
                         chunk = s.recv(min(1024*256, remain))
                         if not chunk: raise ConnectionError("file stream interrupted")
-                        f.write(chunk); remain -= len(chunk)
-                saved.append(dst)
-            return {"ok": True, "saved": saved}
+                        f.write(chunk)
+                        remain -= len(chunk); done += len(chunk)
+                        if progress: progress(done, total)
+            return (True, "OK")
         finally:
             s.close()
+
+    # --- 서버→로컬 다운로드 (트리: 파일/폴더 혼합) ---
+    def download_tree_paths(self, server_paths:list[str], local_target_dir:str, progress=None):
+        os.makedirs(local_target_dir, exist_ok=True)
+        s = self._connect()
+        try:
+            send_json(s, {"cmd":"download_tree_paths","paths": server_paths})
+            jlen = struct.unpack(">I", recv_exact(s,4))[0]
+            head = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            if not head.get("ok"): return (False, head.get("error",""))
+            files = head.get("files", [])
+            total = sum(int(m["size"]) for m in files); done = 0
+            for m in files:
+                rel = m["rel"]; size = int(m["size"])
+                dst = os.path.join(local_target_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "wb") as f:
+                    remain = size
+                    while remain > 0:
+                        chunk = s.recv(min(1024*256, remain))
+                        if not chunk: raise ConnectionError("file stream interrupted")
+                        f.write(chunk)
+                        remain -= len(chunk); done += len(chunk)
+                        if progress: progress(done, total)
+            return (True, "OK")
+        finally:
+            s.close()
+
+    # --- 서버→로컬 ZIP 다운로드 ---
+    def download_paths_as_zip(self, server_paths:list[str], local_target_dir:str, zip_name:str|None=None, progress=None):
+        os.makedirs(local_target_dir, exist_ok=True)
+        s = self._connect()
+        try:
+            send_json(s, {"cmd":"download_paths_as_zip","paths": server_paths, "zip_name": zip_name or ""})
+            jlen = struct.unpack(">I", recv_exact(s,4))[0]
+            head = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            if not head.get("ok"): return (False, head.get("error",""))
+            name = head.get("zip_name") or "bundle.zip"
+            size = int(head.get("size", 0))
+            dst = os.path.join(local_target_dir, name)
+            done = 0
+            with open(dst, "wb") as f:
+                remain = size
+                while remain > 0:
+                    chunk = s.recv(min(1024*256, remain))
+                    if not chunk: raise ConnectionError("zip stream interrupted")
+                    f.write(chunk)
+                    remain -= len(chunk); done += len(chunk)
+                    if progress: progress(done, size)
+            return (True, "OK")
+        finally:
+            s.close()
+
+    # --- 로컬 ZIP 생성 후 업로드 ---
+    def upload_zip_of_local(self, target_dir:str, src_paths:list[str], zip_name:str|None=None, progress=None):
+        if not src_paths: return (False, "no source")
+        # 임시 ZIP 생성
+        tmp_dir = tempfile.gettempdir()
+        if not zip_name:
+            base = os.path.basename(os.path.abspath(src_paths[0])).rstrip("\\/")
+            zip_name = f"{base}_{int(time.time())}.zip"
+        zpath = os.path.join(tmp_dir, zip_name)
+        try:
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in src_paths:
+                    p = os.path.abspath(p)
+                    if os.path.isfile(p):
+                        zf.write(p, arcname=os.path.basename(p))
+                    elif os.path.isdir(p):
+                        base = os.path.basename(p.rstrip("\\/")) or p
+                        for root, _dirs, fnames in os.walk(p):
+                            for fn in fnames:
+                                fp = os.path.join(root, fn)
+                                rel_sub = os.path.relpath(fp, p)
+                                arc = os.path.join(base, rel_sub)
+                                zf.write(fp, arcname=arc)
+            # ZIP 1개 업로드
+            return self.upload_to_dir(target_dir, [zpath], progress=progress)
+        finally:
+            try:
+                if os.path.exists(zpath):
+                    os.remove(zpath)
+            except Exception:
+                pass
 
 # ===== 상단 상태바 =====
 class TopStatusBar(QFrame):
@@ -277,7 +404,6 @@ class ViewerLabel(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
-        # 항상 원격 해상도 비율 유지
         self.keep_aspect = True
         self.remote_size = (0,0)
     def set_keep_aspect(self, on:bool): self.keep_aspect = on
@@ -286,19 +412,15 @@ class ViewerLabel(QLabel):
         rw, rh = self.remote_size
         if rw<=0 or rh<=0: return (0,0)
         lw, lh = self.width(), self.height()
-        if self.keep_aspect:
-            r = min(lw / rw, lh / rh)
-            vw = int(rw * r); vh = int(rh * r)
-            ox = (lw - vw)//2; oy = (lh - vh)//2
-            x = (p.x() - ox); y = (p.y() - oy)
-            if vw>0 and vh>0:
-                rx = int(max(0, min(x, vw)) * rw / vw)
-                ry = int(max(0, min(y, vh)) * rh / vh)
-            else:
-                rx, ry = 0, 0
+        r = min(lw / rw, lh / rh)
+        vw = int(rw * r); vh = int(rh * r)
+        ox = (lw - vw)//2; oy = (lh - vh)//2
+        x = (p.x() - ox); y = (p.y() - oy)
+        if vw>0 and vh>0:
+            rx = int(max(0, min(x, vw)) * rw / vw)
+            ry = int(max(0, min(y, vh)) * rh / vh)
         else:
-            rx = int(p.x() * rw / max(1,lw))
-            ry = int(p.y() * rh / max(1,lh))
+            rx, ry = 0, 0
         return max(0,min(rx,rw-1)), max(0,min(ry,rh-1))
     def mouseMoveEvent(self, e):  self.sig_mouse.emit({"t":"move","x":e.position().x(),"y":e.position().y()})
     def mousePressEvent(self, e):
@@ -326,43 +448,84 @@ class FileList(QListWidget):
             self.sig_paste.emit(); return
         super().keyPressEvent(e)
 
+# ===== 전송 작업 스레드 =====
+class TransferThread(QThread):
+    prog = Signal(int, int)     # done, total
+    done = Signal(bool, str)    # ok, msg
+    def __init__(self, op_callable):
+        super().__init__()
+        self._op = op_callable
+    def run(self):
+        def cb(done, total):
+            self.prog.emit(int(done), int(total))
+        try:
+            ok, msg = self._op(cb)
+        except Exception as ex:
+            ok, msg = False, str(ex)
+        self.done.emit(bool(ok), str(msg))
+
 # ===== 파일 전달 페이지 =====
 class FileTransferPage(QWidget):
     def __init__(self, fc: 'FileClient', parent=None):
         super().__init__(parent)
         self.fc = fc
         self.clip = None  # {"type":"local"|"server", "paths":[...]}
+        self._xfer_thread = None
+
         # 좌(서버)
         self.lbl_left = QLabel("서버 경로:")
         self.ed_left = QLineEdit(); self.ed_left.setReadOnly(True)
+        self.btn_left_send = QPushButton("전달"); self.btn_left_zip = QPushButton("ZIP으로 전달")
+        self.btn_left_send.setEnabled(False); self.btn_left_zip.setEnabled(False)
         self.left_list = FileList()
         self.left_list.sig_copy.connect(self.copy_from_server)
         self.left_list.sig_paste.connect(self.paste_to_server)
+        self.left_list.itemSelectionChanged.connect(self.update_buttons)
+
         # 우(로컬)
         self.lbl_right = QLabel("클라이언트 경로:")
         self.ed_right = QLineEdit(); self.ed_right.setReadOnly(True)
+        self.btn_right_send = QPushButton("전달"); self.btn_right_zip = QPushButton("ZIP으로 전달")
+        self.btn_right_send.setEnabled(False); self.btn_right_zip.setEnabled(False)
         self.right_list = FileList()
         self.right_list.sig_copy.connect(self.copy_from_local)
         self.right_list.sig_paste.connect(self.paste_to_local)
-        # 레이아웃
-        header_l = QHBoxLayout(); header_l.addWidget(self.lbl_left); header_l.addWidget(self.ed_left)
-        header_r = QHBoxLayout(); header_r.addWidget(self.lbl_right); header_r.addWidget(self.ed_right)
+        self.right_list.itemSelectionChanged.connect(self.update_buttons)
+
+        # 버튼 동작 연결
+        self.btn_left_send.clicked.connect(self.on_left_send)
+        self.btn_left_zip.clicked.connect(self.on_left_zip)
+        self.btn_right_send.clicked.connect(self.on_right_send)
+        self.btn_right_zip.clicked.connect(self.on_right_zip)
+
+        # 레이아웃(헤더)
+        header_l = QHBoxLayout(); header_l.addWidget(self.lbl_left); header_l.addWidget(self.ed_left, 1); header_l.addWidget(self.btn_left_send); header_l.addWidget(self.btn_left_zip)
+        header_r = QHBoxLayout(); header_r.addWidget(self.lbl_right); header_r.addWidget(self.ed_right, 1); header_r.addWidget(self.btn_right_send); header_r.addWidget(self.btn_right_zip)
         left_wrap = QVBoxLayout(); left_wrap.addLayout(header_l); left_wrap.addWidget(self.left_list, 1)
         right_wrap = QVBoxLayout(); right_wrap.addLayout(header_r); right_wrap.addWidget(self.right_list, 1)
         left_w = QWidget(); left_w.setLayout(left_wrap)
         right_w = QWidget(); right_w.setLayout(right_wrap)
         spl = QSplitter(); spl.addWidget(left_w); spl.addWidget(right_w); spl.setSizes([600, 600])
-        root = QHBoxLayout(); root.setContentsMargins(8,8,8,8); root.addWidget(spl, 1)
+
+        # 진행률 영역
+        self.prog = QProgressBar(); self.prog.setRange(0,100); self.prog.setValue(0)
+        self.lbl_prog = QLabel("")
+        prog_lay = QHBoxLayout(); prog_lay.addWidget(QLabel("전송 진행:")); prog_lay.addWidget(self.prog, 1); prog_lay.addWidget(self.lbl_prog)
+
+        root = QVBoxLayout(); root.setContentsMargins(8,8,8,8); root.addWidget(spl, 1); root.addLayout(prog_lay)
         self.setLayout(root)
+
         # 초기 경로
         self.server_cwd = None
         self.local_cwd  = os.path.expanduser("~")
         self.refresh_server(self.server_cwd)
         self.refresh_local(self.local_cwd)
+
         # 더블클릭 탐색
         self.left_list.itemDoubleClicked.connect(self.on_double_left)
         self.right_list.itemDoubleClicked.connect(self.on_double_right)
 
+    # --- 목록 갱신 ---
     def refresh_server(self, path: str|None):
         resp = self.fc.list_dir_server(path)
         if not resp.get("ok"):
@@ -393,19 +556,37 @@ class FileTransferPage(QWidget):
         except Exception as ex:
             self.right_list.addItem(QListWidgetItem(f"[ERROR] {ex!s}"))
 
+    # --- 더블클릭 이동 ---
     def on_double_left(self, item: QListWidgetItem):
         meta = item.data(Qt.UserRole)
-        if meta and meta.get("is_dir"): self.refresh_server(meta["path"])
+        if meta and meta.get("is_dir"):
+            self.refresh_server(meta["path"])
 
     def on_double_right(self, item: QListWidgetItem):
         meta = item.data(Qt.UserRole)
-        if meta and meta.get("is_dir"): self.refresh_local(meta["path"])
+        if meta and meta.get("is_dir"):
+            self.refresh_local(meta["path"])
 
+    # --- 버튼 활성화 갱신 ---
+    def update_buttons(self):
+        def has_valid(sel_items):
+            for it in sel_items:
+                meta = it.data(Qt.UserRole)
+                if meta and meta.get("name") != "..":
+                    return True
+            return False
+        self.btn_left_send.setEnabled(has_valid(self.left_list.selectedItems()))
+        self.btn_left_zip.setEnabled(has_valid(self.left_list.selectedItems()))
+        self.btn_right_send.setEnabled(has_valid(self.right_list.selectedItems()))
+        self.btn_right_zip.setEnabled(has_valid(self.right_list.selectedItems()))
+
+    # --- 복사/붙여넣기 (기존 기능 유지) ---
     def copy_from_server(self):
         paths = []
         for it in self.left_list.selectedItems():
             meta = it.data(Qt.UserRole)
-            if meta and not meta.get("is_dir"): paths.append(meta["path"])
+            if meta and meta.get("name")!=".." and not meta.get("is_dir"):
+                paths.append(meta["path"])
         if not paths:
             self.window().statusBar().showMessage("서버: 파일을 선택하세요(폴더 제외).", 3000); return
         self.clip = {"type":"server", "paths": paths}
@@ -414,18 +595,16 @@ class FileTransferPage(QWidget):
     def paste_to_server(self):
         if not self.clip or self.clip.get("type")!="local":
             self.window().statusBar().showMessage("로컬에서 복사(Ctrl+C) 후 서버 창에 붙여넣기(Ctrl+V).", 3000); return
-        res = self.fc.upload_to_dir(self.server_cwd, self.clip["paths"])
-        if res.get("ok"):
-            self.refresh_server(self.server_cwd)
-            self.window().statusBar().showMessage(f"업로드 완료: {len(res.get('saved',[]))}개", 3000)
-        else:
-            self.window().statusBar().showMessage("업로드 실패: "+res.get("error",""), 5000)
+        # 파일만 업로드
+        self.run_transfer(lambda cb: self.fc.upload_to_dir(self.server_cwd, self.clip["paths"], progress=cb),
+                          after=lambda ok: self.refresh_server(self.server_cwd))
 
     def copy_from_local(self):
         paths = []
         for it in self.right_list.selectedItems():
             meta = it.data(Qt.UserRole)
-            if meta and not meta.get("is_dir"): paths.append(meta["path"])
+            if meta and meta.get("name")!=".." and not meta.get("is_dir"):
+                paths.append(meta["path"])
         if not paths:
             self.window().statusBar().showMessage("클라이언트: 파일을 선택하세요(폴더 제외).", 3000); return
         self.clip = {"type":"local", "paths": paths}
@@ -434,14 +613,104 @@ class FileTransferPage(QWidget):
     def paste_to_local(self):
         if not self.clip or self.clip.get("type")!="server":
             self.window().statusBar().showMessage("서버에서 복사(Ctrl+C) 후 클라이언트 창에 붙여넣기(Ctrl+V).", 3000); return
-        res = self.fc.download_paths(self.clip["paths"], self.local_cwd)
-        if res.get("ok"):
-            self.refresh_local(self.local_cwd)
-            self.window().statusBar().showMessage(f"다운로드 완료: {len(res.get('saved',[]))}개", 3000)
-        else:
-            self.window().statusBar().showMessage("다운로드 실패: "+res.get("error",""), 5000)
+        self.run_transfer(lambda cb: self.fc.download_paths(self.clip["paths"], self.local_cwd, progress=cb),
+                          after=lambda ok: self.refresh_local(self.local_cwd))
 
-# ===== 간단 스택 위젯(토글 전환용) =====
+    # --- 전달 버튼 동작 ---
+    def on_left_send(self):
+        # 서버 선택 → 클라이언트 현재 폴더 (폴더 포함 트리)
+        sel = [it.data(Qt.UserRole)["path"] for it in self.left_list.selectedItems()
+               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        if not sel: return
+        self.run_transfer(lambda cb: self.fc.download_tree_paths(sel, self.local_cwd, progress=cb),
+                          after=lambda ok: self.refresh_local(self.local_cwd))
+
+    def on_left_zip(self):
+        # 서버 선택 → 클라이언트 현재 폴더 (서버에서 ZIP 생성)
+        sel = [it.data(Qt.UserRole)["path"] for it in self.left_list.selectedItems()
+               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        if not sel: return
+        self.run_transfer(lambda cb: self.fc.download_paths_as_zip(sel, self.local_cwd, zip_name=None, progress=cb),
+                          after=lambda ok: self.refresh_local(self.local_cwd))
+
+    def on_right_send(self):
+        # 클라이언트 선택 → 서버 현재 폴더 (폴더 포함 트리)
+        sel = [it.data(Qt.UserRole)["path"] for it in self.right_list.selectedItems()
+               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        if not sel: return
+        self.run_transfer(lambda cb: self.fc.upload_tree_to(self.server_cwd, sel, progress=cb),
+                          after=lambda ok: self.refresh_server(self.server_cwd))
+
+    def on_right_zip(self):
+        # 클라이언트 선택 → 서버 현재 폴더 (클라이언트에서 ZIP 생성 후 업로드)
+        sel = [it.data(Qt.UserRole)["path"] for it in self.right_list.selectedItems()
+               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        if not sel: return
+        self.run_transfer(lambda cb: self.fc.upload_zip_of_local(self.server_cwd, sel, zip_name=None, progress=cb),
+                          after=lambda ok: self.refresh_server(self.server_cwd))
+
+    # --- 전송 실행/진행률 UI ---
+    def run_transfer(self, op_callable, after=None):
+        # 이미 전송 중이면 중복 시작 방지
+        if self.has_running_transfer():
+            self.window().statusBar().showMessage("이미 전송 작업이 실행 중입니다.", 3000)
+            return
+
+        # UI 잠금 및 진행률 초기화
+        self.setEnabled_controls(False)
+        self.prog.setValue(0)
+        self.lbl_prog.setText("남은 100%")
+
+        th = TransferThread(op_callable)
+        th.setParent(self)  # 선택: 부모 설정(수명 관리 안정화)
+        self._xfer_thread = th
+
+        th.prog.connect(self.on_progress)
+
+        def on_done(ok, msg):
+            try:
+                self.on_finish(ok, msg)
+                if after:
+                    after(ok)
+            finally:
+                # 스레드 정리
+                self.setEnabled_controls(True)
+                # Qt 객체 해제 지연 예약(선택)
+                th.deleteLater()
+                self._xfer_thread = None
+
+        th.done.connect(on_done)
+        th.start()
+
+    def setEnabled_controls(self, enabled: bool):
+        for w in [self.left_list, self.right_list, self.btn_left_send, self.btn_left_zip, self.btn_right_send, self.btn_right_zip]:
+            w.setEnabled(enabled)
+
+    def on_progress(self, done:int, total:int):
+        pct = int((done * 100 / total)) if total>0 else 0
+        self.prog.setValue(pct)
+        self.lbl_prog.setText(f"남은 {max(0, 100 - pct)}%")
+
+    def on_finish(self, ok:bool, msg:str):
+        if ok:
+            self.lbl_prog.setText("전송 완료")
+            self.window().statusBar().showMessage("전송 완료", 3000)
+        else:
+            self.lbl_prog.setText("전송 실패")
+            self.window().statusBar().showMessage("전송 실패: " + msg, 5000)
+    
+    def has_running_transfer(self) -> bool:
+        return (self._xfer_thread is not None) and self._xfer_thread.isRunning()
+
+    def wait_transfer_finish(self, timeout_ms: int | None = None):
+        """timeout_ms=None 또는 생략 시 무기한 대기, 정수면 해당 ms 만큼 대기"""
+        if self._xfer_thread is not None:
+            if timeout_ms is None:
+                self._xfer_thread.wait()
+            else:
+                self._xfer_thread.wait(timeout_ms)
+
+# ===== 간단 스택 위젯 =====
 class QStackedWidgetSafe(QWidget):
     def __init__(self):
         super().__init__()
@@ -509,7 +778,7 @@ class ClientWindow(QMainWindow):
     def toggle_transfer_page(self, checked: bool):
         self.stack.setCurrentIndex(1 if checked else 0)
         if checked:
-            self.statusBar().showMessage("파일 전달 모드: 좌(서버) / 우(클라이언트). Ctrl+C / Ctrl+V 사용", 5000)
+            self.statusBar().showMessage("파일 전달 모드: 좌(서버) / 우(클라이언트). Ctrl+C / Ctrl+V 또는 상단 버튼 사용", 5000)
         else:
             self.statusBar().clearMessage()
 
@@ -526,7 +795,6 @@ class ClientWindow(QMainWindow):
 
     def redraw(self, qimg:QImage):
         pm = QPixmap.fromImage(qimg)
-        # 항상 원격 해상도 비율 유지
         self.view.set_keep_aspect(True)
         scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.view.setPixmap(scaled)
@@ -539,7 +807,7 @@ class ClientWindow(QMainWindow):
     # --- 마우스/키 → 제어 ---
     def on_mouse_local(self, ev:dict):
         if self.stack.currentIndex()!=0:
-            return  # 파일 전달 모드에서는 원격 입력 차단
+            return
         cursor = QPoint(int(ev.get("x",0)), int(ev.get("y",0)))
         rx, ry = self.view.map_to_remote(cursor)
         t = ev.get("t")
@@ -592,11 +860,30 @@ class ClientWindow(QMainWindow):
         self.page_transfer.refresh_server(None)
 
     def closeEvent(self, e):
+        # 파일 전송 스레드가 돌고 있으면 먼저 종료 대기
+        try:
+            if hasattr(self, "page_transfer") and self.page_transfer and \
+            hasattr(self.page_transfer, "has_running_transfer") and \
+            self.page_transfer.has_running_transfer():
+                self.statusBar().showMessage("파일 전송 마무리 중입니다. 잠시만 기다려주세요...", 3000)
+                # 무기한 대기(안전): self.page_transfer.wait_transfer_finish()
+                # 또는 제한 대기(예: 15초)
+                self.page_transfer.wait_transfer_finish(15000)
+                if self.page_transfer.has_running_transfer():
+                    # 아직 끝나지 않았다면 종료를 막고 사용자에게 알림
+                    QMessageBox.warning(self, "알림", "파일 전송이 진행 중입니다. 전송 완료 후 종료해 주세요.")
+                    e.ignore()
+                    return
+        except Exception:
+            pass
+
+        # ↓ 기존 종료 처리(영상/제어 스레드 정리)는 그대로 유지
         try:
             self.vc.stop(); self.vc.wait(1000)
         except Exception:
             pass
         super().closeEvent(e)
+
 
 def main():
     server_ip = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
