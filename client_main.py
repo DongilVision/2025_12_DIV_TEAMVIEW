@@ -217,17 +217,18 @@ class ControlClient:
 class FileClient:
     def __init__(self, host: str, port: int):
         self.host=host; self.port=port
-    def _connect(self):
+    def _connect(self, timeout: float = 5.0):
         s=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5.0); s.connect((self.host,self.port)); s.settimeout(None); return s
+        s.settimeout(timeout); s.connect((self.host,self.port)); s.settimeout(None); return s
     # 서버 활성 폴더
     def get_server_active_folder(self):
-        s=self._connect()
+        s=self._connect(timeout=2.0)
         try:
             req=json.dumps({"cmd":"active_folder"}).encode("utf-8")
             s.sendall(struct.pack(">I",len(req))+req)
-            jlen_b=recv_exact(s,4)
-            if not jlen_b: return False,""
+            jlen_b = recv_exact(s, 4)
+            if not jlen_b:
+                return False, ""
             jlen=struct.unpack(">I",jlen_b)[0]
             body=recv_exact(s,jlen)
             if not body: return False,""
@@ -235,6 +236,28 @@ class FileClient:
             return bool(resp.get("ok",False)), resp.get("path","")
         finally:
             s.close()
+    # (추가) 서버 클립보드에 파일 존재 여부 사전 확인
+    def server_has_clip_files(self):
+        try:
+            s=self._connect(timeout=1.0)
+        except Exception:
+            return False, 0
+        try:
+            req=json.dumps({"cmd":"probe_clip"}).encode("utf-8")
+            s.sendall(struct.pack(">I",len(req))+req)
+            jlen_b=recv_exact(s,4)
+            if not jlen_b: return False,0
+            jlen=struct.unpack(">I",jlen_b)[0]
+            body=recv_exact(s,jlen)
+            if not body: return False,0
+            resp=json.loads(body.decode("utf-8","ignore"))
+            if not resp.get("ok",True): return False,0
+            return (resp.get("count",0) > 0), int(resp.get("count",0))
+        except Exception:
+            return False, 0
+        finally:
+            try: s.close()
+            except: pass
     # 클라이언트→서버 업로드
     def upload_clipboard_files(self, target_dir:str|None):
         cb=QGuiApplication.clipboard(); md=cb.mimeData(); urls=md.urls() if md else []
@@ -245,7 +268,7 @@ class FileClient:
             if not os.path.isfile(p): continue
             metas.append({"name":os.path.basename(p),"size":int(os.path.getsize(p)),"path":p})
         if not metas: return False,"유효한 파일이 없습니다.",[]
-        s=self._connect()
+        s=self._connect(timeout=5.0)
         try:
             head={"cmd":"upload","files":[{"name":m["name"],"size":m["size"]} for m in metas]}
             if target_dir: head["target_dir"]=target_dir
@@ -257,8 +280,8 @@ class FileClient:
                         b=f.read(1024*256)
                         if not b: break
                         s.sendall(b)
-            jlen_b=recv_exact(s,4)
-            if not jlen_b: return False,"서버 응답 없음",[]
+            jlen_b = recv_exact(s, 4)
+            if not jlen_b: return False, "서버 응답 없음", []
             jlen=struct.unpack(">I",jlen_b)[0]
             ack_raw=recv_exact(s,jlen)
             if not ack_raw: return False,"서버 응답 없음",[]
@@ -269,22 +292,26 @@ class FileClient:
     # 서버→클라이언트 다운로드(서버 클립보드 파일)
     def download_server_clipboard_files(self, target_dir:str|None):
         if not target_dir:
-            # 기본 저장 경로
             base = os.path.expanduser("~/Downloads")
             target_dir = os.path.join(base, "RemoteFromServer")
         os.makedirs(target_dir, exist_ok=True)
-        s=self._connect()
+
+        s=self._connect(timeout=5.0)
         try:
             req=json.dumps({"cmd":"download_clip"}).encode("utf-8")
             s.sendall(struct.pack(">I",len(req))+req)
+
             jlen_b=recv_exact(s,4)
             if not jlen_b: return False,"서버 응답 없음",[]
             jlen=struct.unpack(">I",jlen_b)[0]
-            head_raw=recv_exact(s,jlen)
-            if not head_raw: return False,"서버 응답 없음",[]
+
+            head_raw = recv_exact(s, jlen)
+            if not head_raw: return False, "서버 응답 없음", []
             head=json.loads(head_raw.decode("utf-8","ignore"))
             files=head.get("files",[])
-            if not files: return False,"서버 클립보드에 파일이 없습니다.",[]
+            if not files:
+                return False,"서버 클립보드에 파일이 없습니다.",[]
+
             saved=[]
             for m in files:
                 name=os.path.basename(m.get("name","file")); size=int(m.get("size",0))
@@ -293,7 +320,8 @@ class FileClient:
                     remain=size
                     while remain>0:
                         chunk=s.recv(min(1024*256,remain))
-                        if not chunk: raise ConnectionError("file stream interrupted")
+                        if not chunk:
+                            raise ConnectionError("file stream interrupted")
                         f.write(chunk); remain-=len(chunk)
                 saved.append(dst)
             return True, target_dir, saved
@@ -353,19 +381,24 @@ class ClientWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("원격 뷰어 클라이언트"); self.resize(1100, 720)
         self.server_ip = server_ip
+
         self.topbar = TopStatusBar(); self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
         self.btn_full=QPushButton("전체크기"); self.btn_full.clicked.connect(self.on_fullscreen)
         self.btn_keep=QPushButton("원격해상도유지"); self.btn_keep.setCheckable(True); self.btn_keep.setChecked(True)
         self.ed_ip=QLineEdit(self.server_ip); self.ed_ip.setFixedWidth(160)
         self.btn_re=QPushButton("재연결"); self.btn_re.clicked.connect(self.on_reconnect)
+
         self.view = ViewerLabel("원격 화면 수신 대기")
         self.view.setAlignment(Qt.AlignCenter); self.view.setStyleSheet("background:#202020; color:#DDDDDD;")
         self.view.sig_mouse.connect(self.on_mouse_local)
+
         ctrl=QHBoxLayout(); ctrl.setContentsMargins(8,4,8,4); ctrl.setSpacing(8)
         ctrl.addWidget(self.btn_full); ctrl.addWidget(self.btn_keep); ctrl.addStretch(1)
         ctrl.addWidget(QLabel("서버 IP:")); ctrl.addWidget(self.ed_ip); ctrl.addWidget(self.btn_re)
+
         v=QVBoxLayout(); v.addWidget(self.topbar); v.addLayout(ctrl); v.addWidget(self.view,1)
         wrap=QWidget(); wrap.setLayout(v); self.setCentralWidget(wrap)
+
         # 네트워크
         self.vc=VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status)
         self.vc.sig_frame.connect(self.on_frame); self.vc.start()
@@ -401,31 +434,37 @@ class ClientWindow(QMainWindow):
     def keyPressEvent(self, e):
         if e.isAutoRepeat(): return
 
-        # ---- Ctrl+V 인터셉트 ----
+        # ---- Ctrl+V: 우선순위 = 서버 CF_HDROP 존재 → 서버→클, 그 외 로컬 파일 → 클→서 ----
         if (e.modifiers() & Qt.ControlModifier) and e.key() == Qt.Key_V:
-            # 1) 로컬에 파일 있으면: 서버로 업로드 (서버 활성 폴더 우선)
-            cb = QGuiApplication.clipboard(); md = cb.mimeData()
+            mods = e.modifiers()
+            force_download = bool(mods & Qt.AltModifier)      # Ctrl+Alt+V : 서버→클 강제
+            force_upload   = bool(mods & Qt.ShiftModifier)    # Ctrl+Shift+V : 클→서 강제
+
+            # 로컬 클립보드 파일 존재 여부
+            cb = QGuiApplication.clipboard()
+            md = cb.mimeData()
             local_has_files = bool(md and md.urls() and any(u.isLocalFile() for u in md.urls()))
-            if local_has_files:
+
+            # 서버 클립보드 사전 확인
+            has_server_files, _cnt = self.fc.server_has_clip_files()
+
+            # 방향 결정
+            if force_download or (has_server_files and not force_upload):
+                target_local = get_local_explorer_folder_under_cursor()
+                ok_dl, saved_dir, saved = self.fc.download_server_clipboard_files(target_local)
+                msg = f"클라이언트 저장: {saved_dir} ({len(saved)}개)" if ok_dl else saved_dir
+                self.statusBar().showMessage(msg, 4000)
+                return
+
+            if force_upload or local_has_files:
                 ok_path, active_dir = self.fc.get_server_active_folder()
                 ok_up, saved_dir, saved_paths = self.fc.upload_clipboard_files(active_dir if ok_path else None)
-                if ok_up:
-                    self.statusBar().showMessage(
-                        f"서버 저장: {active_dir if ok_path else saved_dir}", 4000
-                    )
-                else:
-                    self.statusBar().showMessage("업로드 실패", 4000)
-                return  # V down 소비
+                msg = f"서버 저장: {active_dir if ok_path else saved_dir}" if ok_up else "업로드 실패"
+                self.statusBar().showMessage(msg, 4000)
+                return
 
-            # 2) 로컬에 파일이 없으면: 서버 클립보드에서 가져와 로컬로 저장
-            target_local = get_local_explorer_folder_under_cursor()  # 커서 아래 Explorer 폴더
-            ok_dl, saved_dir, saved = self.fc.download_server_clipboard_files(target_local)
-            if ok_dl:
-                msg = f"클라이언트 저장: {saved_dir} ({len(saved)}개)"
-            else:
-                msg = saved_dir  # 실패 메시지
-            self.statusBar().showMessage(msg, 4000)
-            return  # V down 소비
+            self.statusBar().showMessage("서버/클립보드에 파일이 없습니다.", 3000)
+            return
 
         # 일반 키 전송
         vk = qt_to_vk(e)

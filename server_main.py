@@ -55,7 +55,6 @@ def recv_exact(sock: socket.socket, n: int) -> bytes | None:
 def get_active_explorer_folder() -> str | None:
     """
     서버 PC에서 전면(포커스) 탐색기 창의 폴더 경로 반환. 실패 시 None.
-    (win32com.client 사용; 미설치시 None)
     """
     try:
         import win32com.client
@@ -86,7 +85,7 @@ def get_clipboard_file_paths_win32(max_retries: int = 6, wait_ms: int = 80) -> l
     GUI 스레드가 아니어도 사용 가능. 잠금 충돌 시 재시도.
     """
     if not (win32clipboard and win32con):
-        return []  # pywin32 미설치 시 빈 리스트
+        return []
     for _ in range(max_retries):
         try:
             win32clipboard.OpenClipboard()
@@ -257,7 +256,7 @@ class ControlServer(QThread):
             if vk:
                 keybd_event(vk, 0, 0 if down else KEYEVENTF_KEYUP, 0)
                 return
-            # 구버전 fallback: "key" 문자열
+            # 구버전 fallback
             name = m.get("key","")
             if not name: return
             if name == " ": name = "SPACE"
@@ -292,12 +291,8 @@ class FileServer(QThread):
     """
     요청 종류:
     - {"cmd":"active_folder"}  → 현재 활성 탐색기 폴더 경로 반환
-      응답: {"ok":true, "path":"C:\\..."} 또는 {"ok":false}
-
+    - {"cmd":"probe_clip"}     → 서버 클립보드(CF_HDROP) 파일 존재/개수 조회(헤더만)
     - {"cmd":"upload","files":[{name,size}...], "target_dir":"C:\\..."} + 본문
-      응답: {"ok":true, "saved_dir": "...", "saved_paths":[...]}
-      target_dir 없으면 Downloads/RemoteDrop으로 저장(폴백)
-
     - {"cmd":"download_clip"}  → 서버 클립보드(CF_HDROP) 파일 목록/본문 스트리밍
     """
     def __init__(self, host: str, port: int):
@@ -339,6 +334,9 @@ class FileServer(QThread):
                 sock.sendall(struct.pack(">I", len(raw)) + raw)
                 return
 
+            if cmd == "probe_clip":
+                self._handle_probe_clip(sock); return
+
             if cmd == "upload":
                 self._handle_upload(sock, req); return
 
@@ -349,6 +347,19 @@ class FileServer(QThread):
         finally:
             try: sock.close()
             except: pass
+
+    def _handle_probe_clip(self, sock):
+        paths = get_clipboard_file_paths_win32()
+        metas = []
+        for p in paths:
+            try:
+                if os.path.isfile(p):
+                    size = os.path.getsize(p)
+                    metas.append({"name": os.path.basename(p), "size": int(size)})
+            except Exception:
+                pass
+        resp = json.dumps({"ok": True, "count": len(metas), "files": metas}).encode("utf-8")
+        sock.sendall(struct.pack(">I", len(resp)) + resp)
 
     def _handle_upload(self, sock, req):
         files = req.get("files", [])
@@ -382,7 +393,7 @@ class FileServer(QThread):
         헤더(JSON) + 바디(파일 스트림)로 전송.
         ※ QClipboard 대신 pywin32(win32clipboard)로 읽어 스레드 안전성 확보.
         """
-        # 1) 클립보드에서 파일 목록 읽기 (스레드 안전, 재시도)
+        # 1) 클립보드에서 파일 목록 읽기
         paths = get_clipboard_file_paths_win32()
 
         # 2) 메타 구성
