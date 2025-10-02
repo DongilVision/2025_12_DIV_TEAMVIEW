@@ -25,7 +25,7 @@ user32 = ctypes.windll.user32
 SetCursorPos   = user32.SetCursorPos
 mouse_event    = user32.mouse_event
 keybd_event    = user32.keybd_event
-
+_CLIPBOARD_OBJ_HOLD = {"obj": None, "ts": 0}
 MOUSEEVENTF_LEFTDOWN   = 0x0002
 MOUSEEVENTF_LEFTUP     = 0x0004
 MOUSEEVENTF_RIGHTDOWN  = 0x0008
@@ -207,6 +207,9 @@ def set_virtual_files_to_clipboard(files: list[dict]):
     pythoncom.OleInitialize()
     obj = VirtualFileDataObject(files)
     pythoncom.OleSetClipboard(obj)
+    # ★ 붙여넣기 대상이 읽어갈 때까지 객체 보관 (예: 120초)
+    _CLIPBOARD_OBJ_HOLD["obj"] = obj
+    _CLIPBOARD_OBJ_HOLD["ts"]  = time.time()
 
 # ============ 제어 서버 ============
 class ControlServer(QThread):
@@ -438,6 +441,13 @@ class ServerWindow(QMainWindow):
         self.tray.setIcon(QIcon.fromTheme("application-exit"))
         menu = QMenu(); act_quit = QAction("종료", self); act_quit.triggered.connect(self.close)
         menu.addAction(act_quit); self.tray.setContextMenu(menu); self.tray.show()
+        self._gc_timer = QTimer(self)
+        self._gc_timer.timeout.connect(self._gc_clip_obj)
+        self._gc_timer.start(5000)
+        
+    def _gc_clip_obj(self):
+        if _CLIPBOARD_OBJ_HOLD["obj"] and time.time() - _CLIPBOARD_OBJ_HOLD["ts"] > 120:
+            _CLIPBOARD_OBJ_HOLD["obj"] = None  # 참조 해제(가비지 컬렉션 허용)
 
     def on_video_conn(self, n:int): self._update_conn_label(n, None)
     def on_ctrl_conn(self, ok:bool): self._update_conn_label(None, ok)
