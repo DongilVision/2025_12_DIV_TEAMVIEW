@@ -23,7 +23,7 @@ class RemoteClient(QThread):
         self.socket = None
         self.connected = False
         self.running = False
-        self.server_ip = "192.168.2.130"
+        self.server_ip = "127.0.0.1"
         self.server_port = 5555
         self.last_frame_time = time.time()
         self.fps = 0

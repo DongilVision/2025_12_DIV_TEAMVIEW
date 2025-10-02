@@ -11,10 +11,9 @@ from datetime import datetime
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
-import mss
 import pickle
 import pyperclip
-from PIL import Image
+from PIL import Image, ImageGrab
 import pynput
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, Controller as KeyboardController
@@ -32,7 +31,6 @@ class RemoteServer(QThread):
         self.running = False
         self.mouse = MouseController()
         self.keyboard = KeyboardController()
-        self.screen_grabber = mss.mss()
         self.clipboard_content = None
         self.clipboard_files = []
         
@@ -133,15 +131,12 @@ class RemoteServer(QThread):
         try:
             while self.running:
                 try:
-                    monitor = self.screen_grabber.monitors[0]
-                    screenshot = self.screen_grabber.grab(monitor)
-                    
-                    # PIL Image로 변환
-                    img = Image.frombytes('RGB', (screenshot.width, screenshot.height), screenshot.rgb)
+                    # PIL ImageGrab을 사용한 화면 캡처
+                    screenshot = ImageGrab.grab()
                     
                     # JPEG로 압축
                     img_byte_arr = io.BytesIO()
-                    img.save(img_byte_arr, format='JPEG', quality=70)
+                    screenshot.save(img_byte_arr, format='JPEG', quality=70)
                     img_data = img_byte_arr.getvalue()
                     
                     # 화면 크기 정보와 함께 전송
