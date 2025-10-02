@@ -3,8 +3,8 @@ import socket
 
 DEFAULT_HOST   = "0.0.0.0"
 VIDEO_PORT     = 50007   # 영상 전송
-CONTROL_PORT   = 50008   # 입력 제어
-FILE_PORT      = 50009   # 파일/클립보드/활성폴더 질의
+CONTROL_PORT   = 50008   # 입력/클립보드 이벤트 채널(양방향)
+FILE_PORT      = 50009   # 파일/클립보드 파일 업로드·다운로드
 FRAME_FPS      = 12
 JPEG_QUALITY   = 80
 
