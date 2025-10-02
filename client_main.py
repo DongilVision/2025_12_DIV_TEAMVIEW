@@ -109,41 +109,37 @@ class VideoClient(QThread):
     def __init__(self, host: str, port: int):
         super().__init__()
         self.host = host; self.port = port
-        self._stop = False; self._sock = None
-        self._connected = False; self._conn_ts = None
-        self._frame_count = 0; self._last_fps_ts = time.time()
+        self._stop=False; self._sock=None; self._connected=False
+        self._conn_ts=None; self._frame_count=0; self._last_ts=time.time()
     def run(self):
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(5.0); self._sock.connect((self.host, self.port))
-            self._sock.settimeout(None)
-            self._connected = True; self._conn_ts = time.time()
+            self._sock.settimeout(None); self._connected=True; self._conn_ts=time.time()
         except Exception:
             self.sig_status.emit(0.0, 0, False); return
         try:
             while not self._stop:
                 hdr = recv_exact(self._sock, 12)
                 if not hdr: break
-                data_len, w, h = struct.unpack(">III", hdr)
-                blob = recv_exact(self._sock, data_len)
+                n,w,h = struct.unpack(">III", hdr)
+                blob = recv_exact(self._sock, n)
                 if not blob: break
-                arr = np.frombuffer(blob, dtype=np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                img = cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
                     self.sig_frame.emit(np_bgr_to_qimage(img), w, h)
                     self._frame_count += 1
-                now = time.time()
-                if now - self._last_fps_ts >= 1.0:
-                    fps = float(self._frame_count); self._frame_count = 0; self._last_fps_ts = now
-                    elapsed = int(now - (self._conn_ts or now))
+                now=time.time()
+                if now - self._last_ts >= 1.0:
+                    fps=float(self._frame_count); self._frame_count=0; self._last_ts=now
+                    elapsed=int(now - (self._conn_ts or now))
                     self.sig_status.emit(fps, elapsed, self._connected)
         finally:
             try:
                 if self._sock: self._sock.close()
             except Exception: pass
-            self._connected = False
-            self.sig_status.emit(0.0, 0, False)
-    def stop(self): self._stop = True
+            self._connected=False; self.sig_status.emit(0.0,0,False)
+    def stop(self): self._stop=True
 
 # ---- 제어 송신 ----
 class ControlClient:
@@ -165,24 +161,24 @@ class ControlClient:
             self.connect()
             if not self.sock: return
         try:
-            body = json.dumps(obj).encode("utf-8")
-            head = struct.pack(">I", len(body))
-            self.sock.sendall(head+body)
+            raw = json.dumps(obj).encode("utf-8")
+            self.sock.sendall(struct.pack(">I", len(raw)) + raw)
         except Exception:
             try: self.sock.close()
             except: pass
-            self.sock = None
+            self.sock=None
     def send_key(self, vk:int, down:bool):
         if vk: self.send_json({"t":"key","vk":int(vk),"down":bool(down)})
 
-# ---- 파일/활성폴더 클라이언트 ----
+# ---- 양방향 파일/활성폴더 클라이언트 ----
 class FileClient:
     def __init__(self, host: str, port: int):
         self.host = host; self.port = port
     def _connect(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5.0); s.connect((self.host, self.port))
-        s.settimeout(None); return s
+        s.settimeout(5.0); s.connect((self.host, self.port)); s.settimeout(None)
+        return s
+    # 서버 활성 폴더
     def get_server_active_folder(self):
         s = self._connect()
         try:
@@ -193,20 +189,54 @@ class FileClient:
             jlen = struct.unpack(">I", jlen_b)[0]
             body = recv_exact(s, jlen)
             if not body: return False, ""
-            resp = json.loads(body.decode("utf-8", errors="ignore"))
-            return bool(resp.get("ok", False)), resp.get("path","")
+            resp = json.loads(body.decode("utf-8","ignore"))
+            return bool(resp.get("ok")), resp.get("path","")
         finally:
             s.close()
-    def upload_clipboard_files(self, target_dir:str|None):
-        cb = QGuiApplication.clipboard()
-        md = cb.mimeData()
+    # 서버 클립보드 → 로컬 저장
+    def download_from_server_clip(self, target_dir: str | None):
+        if not target_dir or not os.path.isdir(target_dir):
+            # 폴백 디렉터리
+            base = os.path.join(os.path.expanduser("~"), "Downloads")
+            target_dir = os.path.join(base, "RemoteFromServer")
+        os.makedirs(target_dir, exist_ok=True)
+        s = self._connect()
+        try:
+            req = json.dumps({"cmd":"download_clip"}).encode("utf-8")
+            s.sendall(struct.pack(">I", len(req)) + req)
+            # 헤더
+            jlen_b = recv_exact(s, 4)
+            if not jlen_b: return False, "서버 응답 없음", []
+            jlen = struct.unpack(">I", jlen_b)[0]
+            head = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            files = head.get("files", [])
+            if not files:
+                return False, "서버 클립보드에 파일이 없습니다.", []
+            saved=[]
+            for m in files:
+                name = os.path.basename(m.get("name","file"))
+                size = int(m.get("size",0))
+                dst  = os.path.join(target_dir, name)
+                with open(dst, "wb") as f:
+                    remain=size
+                    while remain>0:
+                        chunk = s.recv(min(1024*256, remain))
+                        if not chunk: raise ConnectionError("file stream interrupted")
+                        f.write(chunk); remain -= len(chunk)
+                saved.append(dst)
+            return True, target_dir, saved
+        finally:
+            s.close()
+    # 로컬 클립보드 → 서버 저장
+    def upload_local_clip_to_server(self, target_dir: str | None):
+        cb = QGuiApplication.clipboard(); md = cb.mimeData()
         urls = md.urls() if md else []
         paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
         if not paths: return False, "클립보드에 파일이 없습니다.", []
-        metas = []
+        metas=[]
         for p in paths:
-            if not os.path.isfile(p): continue
-            metas.append({"name": os.path.basename(p), "size": int(os.path.getsize(p)), "path": p})
+            if os.path.isfile(p):
+                metas.append({"name": os.path.basename(p), "size": int(os.path.getsize(p)), "path": p})
         if not metas: return False, "유효한 파일이 없습니다.", []
         s = self._connect()
         try:
@@ -223,14 +253,33 @@ class FileClient:
             jlen_b = recv_exact(s, 4)
             if not jlen_b: return False, "서버 응답 없음", []
             jlen = struct.unpack(">I", jlen_b)[0]
-            ack_raw = recv_exact(s, jlen)
-            if not ack_raw: return False, "서버 응답 없음", []
-            ack = json.loads(ack_raw.decode("utf-8", errors="ignore"))
-            return bool(ack.get("ok", False)), ack.get("saved_dir",""), ack.get("saved_paths",[])
+            ack = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
+            return bool(ack.get("ok")), ack.get("saved_dir",""), ack.get("saved_paths",[])
         finally:
             s.close()
 
-# ---- UI 컴포넌트 ----
+# ---- 로컬(클라이언트) 활성 탐색기 폴더 조회 ----
+def get_local_active_explorer_folder() -> str | None:
+    try:
+        import win32com.client, win32gui
+    except Exception:
+        return None
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        shell = win32com.client.Dispatch("Shell.Application")
+        for w in shell.Windows():
+            try:
+                if int(w.HWND) == hwnd and getattr(w, "Document", None):
+                    folder = w.Document.Folder
+                    if folder and folder.Self and os.path.isdir(folder.Self.Path):
+                        return folder.Self.Path
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+# ---- UI ----
 class TopStatusBar(QFrame):
     def __init__(self):
         super().__init__()
@@ -239,130 +288,122 @@ class TopStatusBar(QFrame):
         lay = QHBoxLayout(); lay.setContentsMargins(8,0,8,0); lay.setSpacing(16)
         lay.addWidget(self.lbl_time); lay.addWidget(self.lbl_fps); lay.addWidget(self.lbl_ip); lay.addStretch(1)
         self.setLayout(lay)
-    def update_time(self, seconds:int):
-        h=seconds//3600; m=(seconds%3600)//60; s=seconds%60
-        self.lbl_time.setText(f"경과 {h:02d}:{m:02d}:{s:02d}")
+    def update_time(self, s:int):
+        h=s//3600; m=(s%3600)//60; sec=s%60
+        self.lbl_time.setText(f"경과 {h:02d}:{m:02d}:{sec:02d}")
     def update_fps(self, fps:float): self.lbl_fps.setText(f"FPS {int(fps)}")
-    def update_ip(self, ip_text:str): self.lbl_ip.setText(f"서버: {ip_text}")
+    def update_ip(self, txt:str): self.lbl_ip.setText(f"서버: {txt}")
 
 class ViewerLabel(QLabel):
     sig_mouse = Signal(dict)
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True); self.setFocusPolicy(Qt.StrongFocus)
-        self.keep_aspect = True; self.remote_size = (0,0)
+        self.keep_aspect=True; self.remote_size=(0,0)
     def set_keep_aspect(self, on:bool): self.keep_aspect = on
-    def set_remote_size(self, w:int, h:int): self.remote_size = (w,h)
+    def set_remote_size(self, w:int, h:int): self.remote_size=(w,h)
     def map_to_remote(self, p: QPoint) -> tuple[int,int]:
         rw, rh = self.remote_size
         if rw<=0 or rh<=0: return (0,0)
         lw, lh = self.width(), self.height()
         if self.keep_aspect:
-            r = min(lw / rw, lh / rh)
-            vw = int(rw * r); vh = int(rh * r)
-            ox = (lw - vw)//2; oy = (lh - vh)//2
-            x = (p.x() - ox); y = (p.y() - oy)
-            if vw>0 and vh>0:
-                rx = int(max(0, min(x, vw)) * rw / vw)
-                ry = int(max(0, min(y, vh)) * rh / vh)
-            else: rx, ry = 0, 0
+            r = min(lw / rw, lh / rh); vw=int(rw*r); vh=int(rh*r)
+            ox=(lw-vw)//2; oy=(lh-vh)//2
+            x=max(0,min(p.x()-ox, vw)); y=max(0,min(p.y()-oy, vh))
+            rx=int(x*rw/max(1,vw)); ry=int(y*rh/max(1,vh))
         else:
-            rx = int(p.x() * rw / max(1,lw)); ry = int(p.y() * rh / max(1,lh))
-        rx = max(0, min(rx, rw-1)); ry = max(0, min(ry, rh-1)); return (rx, ry)
+            rx=int(p.x()*rw/max(1,lw)); ry=int(p.y()*rh/max(1,lh))
+        return (max(0,min(rx,rw-1)), max(0,min(ry,rh-1)))
     def mouseMoveEvent(self, e):  self.sig_mouse.emit({"t":"move","x":e.position().x(),"y":e.position().y()})
     def mousePressEvent(self, e):
-        btn = "left" if e.button()==Qt.LeftButton else "right" if e.button()==Qt.RightButton else "middle"
+        btn="left" if e.button()==Qt.LeftButton else "right" if e.button()==Qt.RightButton else "middle"
         self.sig_mouse.emit({"t":"down","btn":btn,"x":e.position().x(),"y":e.position().y()})
     def mouseReleaseEvent(self, e):
-        btn = "left" if e.button()==Qt.LeftButton else "right" if e.button()==Qt.RightButton else "middle"
+        btn="left" if e.button()==Qt.LeftButton else "right" if e.button()==Qt.RightButton else "middle"
         self.sig_mouse.emit({"t":"up","btn":btn,"x":e.position().x(),"y":e.position().y()})
-    def wheelEvent(self, e):
-        delta = e.angleDelta().y()
-        self.sig_mouse.emit({"t":"wheel","delta":delta})
+    def wheelEvent(self, e): self.sig_mouse.emit({"t":"wheel","delta": e.angleDelta().y()})
 
-# ---- 메인 윈도우 ----
 class ClientWindow(QMainWindow):
     def __init__(self, server_ip: str):
         super().__init__()
-        self.setWindowTitle("원격 뷰어 클라이언트")
-        self.resize(1100, 720)
+        self.setWindowTitle("원격 뷰어 클라이언트"); self.resize(1100, 720)
         self.server_ip = server_ip
-
         self.topbar = TopStatusBar(); self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
         self.btn_full = QPushButton("전체크기"); self.btn_full.clicked.connect(self.on_fullscreen)
         self.btn_keep = QPushButton("원격해상도유지"); self.btn_keep.setCheckable(True); self.btn_keep.setChecked(True)
-
         self.ed_ip = QLineEdit(self.server_ip); self.ed_ip.setFixedWidth(160)
         self.btn_re = QPushButton("재연결"); self.btn_re.clicked.connect(self.on_reconnect)
-
-        self.view = ViewerLabel("원격 화면 수신 대기")
-        self.view.setAlignment(Qt.AlignCenter)
-        self.view.setStyleSheet("background:#202020; color:#DDDDDD;")
-        self.view.sig_mouse.connect(self.on_mouse_local)
-
+        self.view = ViewerLabel("원격 화면 수신 대기"); self.view.setAlignment(Qt.AlignCenter)
+        self.view.setStyleSheet("background:#202020; color:#DDDDDD;"); self.view.sig_mouse.connect(self.on_mouse_local)
         ctrl = QHBoxLayout(); ctrl.setContentsMargins(8,4,8,4); ctrl.setSpacing(8)
         ctrl.addWidget(self.btn_full); ctrl.addWidget(self.btn_keep); ctrl.addStretch(1)
         ctrl.addWidget(QLabel("서버 IP:")); ctrl.addWidget(self.ed_ip); ctrl.addWidget(self.btn_re)
-
-        v = QVBoxLayout(); v.addWidget(self.topbar); v.addLayout(ctrl); v.addWidget(self.view, 1)
+        v = QVBoxLayout(); v.addWidget(self.topbar); v.addLayout(ctrl); v.addWidget(self.view,1)
         wrap = QWidget(); wrap.setLayout(v); self.setCentralWidget(wrap)
 
         self.vc = VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status); self.vc.sig_frame.connect(self.on_frame); self.vc.start()
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
         self.fc = FileClient(self.server_ip, FILE_PORT)
+        self.view.setFocusPolicy(Qt.StrongFocus)
+        self.btn_keep.clicked.connect(self.on_keep_toggle)
 
     # 상태/프레임
     def on_status(self, fps:float, elapsed:int, connected:bool):
-        self.topbar.update_fps(fps); 
-        self.topbar.update_time(elapsed if connected else 0)
+        self.topbar.update_fps(fps); self.topbar.update_time(elapsed if connected else 0)
         if not connected: self.view.setText("연결 끊김")
     def on_frame(self, qimg:QImage, w:int, h:int):
         self.view.set_remote_size(w,h); self.redraw(qimg)
     def redraw(self, qimg:QImage):
         pm = QPixmap.fromImage(qimg)
-        mode_keep = self.btn_keep.isChecked()
-        scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio if mode_keep else Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        self.view.setPixmap(scaled)
+        mode = self.btn_keep.isChecked()
+        self.view.set_keep_aspect(mode)
+        self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio if mode else Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
     def resizeEvent(self, e):
         if self.view.pixmap() and not self.view.pixmap().isNull():
             self.redraw(self.view.pixmap().toImage())
         super().resizeEvent(e)
 
-    # ---- 입력 전송 ----
+    # 마우스/휠
     def on_mouse_local(self, ev:dict):
         cursor = QPoint(int(ev.get("x",0)), int(ev.get("y",0)))
-        rx, ry = self.view.map_to_remote(cursor)
-        t = ev.get("t")
+        rx, ry = self.view.map_to_remote(cursor); t = ev.get("t")
         if t == "move":
-            self.cc.send_json({"t":"mouse_move", "x":rx, "y":ry})
+            self.cc.send_json({"t":"mouse_move","x":rx,"y":ry})
         elif t == "down":
-            self.cc.send_json({"t":"mouse_move", "x":rx, "y":ry})
-            self.cc.send_json({"t":"mouse_down", "btn": ev.get("btn","left")})
+            self.cc.send_json({"t":"mouse_move","x":rx,"y":ry})
+            self.cc.send_json({"t":"mouse_down","btn":ev.get("btn","left")})
         elif t == "up":
-            self.cc.send_json({"t":"mouse_up", "btn": ev.get("btn","left")})
+            self.cc.send_json({"t":"mouse_up","btn":ev.get("btn","left")})
         elif t == "wheel":
-            self.cc.send_json({"t":"mouse_wheel", "delta": int(ev.get("delta",0))})
+            self.cc.send_json({"t":"mouse_wheel","delta":int(ev.get("delta",0))})
 
+    # ---- 키 처리: 양방향 파일 붙여넣기 ----
     def keyPressEvent(self, e):
         if e.isAutoRepeat(): return
-
-        # ---- Ctrl+V 가로채기: 클립보드에 '파일'이 있을 때만 ----
+        # 1) Ctrl+V: 양방향 파일 처리
         if (e.modifiers() & Qt.ControlModifier) and e.key() == Qt.Key_V:
-            ok_path, active_dir = self.fc.get_server_active_folder()
-            ok_up, saved_dir, saved_paths = self.fc.upload_clipboard_files(active_dir if ok_path else None)
-            if ok_up and saved_paths:
-                # 활성 폴더에 바로 저장된 경우: 새로고침(F5)만 보내 UI 갱신
-                if ok_path and active_dir and os.path.isdir(active_dir):
-                    self.cc.send_key(0x74, True)   # VK_F5
-                    self.cc.send_key(0x74, False)
-                    self.statusBar().showMessage(f"서버 폴더에 저장됨: {active_dir}", 4000)
-                else:
-                    # 폴백: RemoteDrop에 저장 → 클립보드 경로로 붙여넣기 자동주입
-                    self.cc.send_json({"t":"set_clip_files", "paths": saved_paths, "and_paste": True})
-                    self.statusBar().showMessage(f"폴백: {saved_dir}에서 붙여넣기", 4000)
-                return  # V down 소비
+            # (A) 로컬 클립보드에 파일이 있으면 → 서버 활성 폴더로 업로드
+            if self._local_clip_has_files():
+                ok_path, srv_dir = self.fc.get_server_active_folder()
+                ok_up, saved_dir, saved_paths = self.fc.upload_local_clip_to_server(srv_dir if ok_path else None)
+                if ok_up and saved_paths:
+                    # 서버 쪽 탐색기 갱신(F5)
+                    self.cc.send_key(VK["F5"], True); self.cc.send_key(VK["F5"], False)
+                    self.statusBar().showMessage(f"서버에 저장됨: {saved_dir}", 4000)
+                    return
+            # (B) 로컬에 파일이 없으면 → 서버 클립보드에서 내려받아 로컬 활성 폴더로 저장
+            local_dir = get_local_active_explorer_folder()
+            ok_down, saved_dir, saved_paths = self.fc.download_from_server_clip(local_dir or None)
+            if ok_down and saved_paths:
+                # 로컬 탐색기 갱신(F5) 시도: (로컬 키 주입 대신 사용자 환경에 맡김)
+                self.statusBar().showMessage(f"로컬에 저장됨: {saved_dir}", 4000)
+                return
+            # (C) 둘 다 아니면 일반 Ctrl+V 전달
+            self.cc.send_key(VK["CTRL"], True); self.cc.send_key(ord('V'), True)
+            self.cc.send_key(ord('V'), False); self.cc.send_key(VK["CTRL"], False)
+            return
 
-        # 평소 키 전송
+        # 일반 키 전송
         vk = qt_to_vk(e)
         if vk: self.cc.send_key(vk, True)
 
@@ -371,13 +412,15 @@ class ClientWindow(QMainWindow):
         vk = qt_to_vk(e)
         if vk: self.cc.send_key(vk, False)
 
+    def _local_clip_has_files(self) -> bool:
+        md = QGuiApplication.clipboard().mimeData()
+        return bool(md and any(u.isLocalFile() for u in md.urls()))
+
     # 기타
-    def on_keep_toggle(self, checked:bool):
-        if self.view.pixmap():
-            self.redraw(self.view.pixmap().toImage())
+    def on_keep_toggle(self, _):
+        if self.view.pixmap(): self.redraw(self.view.pixmap().toImage())
     def on_fullscreen(self):
-        if self.isFullScreen(): self.showNormal()
-        else: self.showFullScreen()
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
     def on_reconnect(self):
         ip = self.ed_ip.text().strip()
         if not ip:
@@ -386,16 +429,14 @@ class ClientWindow(QMainWindow):
         self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
         try:
             self.vc.stop(); self.vc.wait(1000)
-        except Exception:
-            pass
+        except Exception: pass
         self.vc = VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status); self.vc.sig_frame.connect(self.on_frame); self.vc.start()
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
         self.fc = FileClient(self.server_ip, FILE_PORT)
     def closeEvent(self, e):
         try:
             self.vc.stop(); self.vc.wait(1000)
-        except Exception:
-            pass
+        except Exception: pass
         super().closeEvent(e)
 
 def main():
