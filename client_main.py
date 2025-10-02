@@ -1,14 +1,15 @@
 # client_main.py
-import sys, time, socket, struct, json, os, tempfile, zipfile
+import sys, time, socket, struct, json, os, tempfile, zipfile, math
 import numpy as np
 import cv2
+from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint
-from PySide6.QtGui import QImage, QPixmap, QGuiApplication
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
-    QPushButton, QFrame, QLineEdit, QMessageBox, QListWidget, QListWidgetItem,
-    QSplitter, QProgressBar
+    QPushButton, QFrame, QLineEdit, QMessageBox, QSplitter, QProgressBar,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle
 )
 
 from common import VIDEO_PORT, CONTROL_PORT, FILE_PORT
@@ -31,6 +32,22 @@ def recv_exact(sock: socket.socket, n: int) -> bytes | None:
 def send_json(sock: socket.socket, obj: dict):
     raw = json.dumps(obj).encode("utf-8")
     sock.sendall(struct.pack(">I", len(raw)) + raw)
+
+def human_size(n: int) -> str:
+    if n is None: return ""
+    if n < 1024: return f"{n} B"
+    units = ["KB","MB","GB","TB","PB"]
+    x = float(n); i = -1
+    while x >= 1024 and i < len(units)-1:
+        x /= 1024.0; i += 1
+    return f"{x:.1f} {units[i]}"
+
+def fmt_mtime(epoch: float|int|None) -> str:
+    if not epoch: return ""
+    try:
+        return datetime.fromtimestamp(float(epoch)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
 
 # ===== Qt Key -> Windows VK =====
 VK = {
@@ -199,7 +216,6 @@ class FileClient:
         s.settimeout(5.0); s.connect((self.host, self.port)); s.settimeout(None)
         return s
 
-    # --- 서버 디렉토리 목록 ---
     def list_dir_server(self, path:str|None=None):
         s = self._connect()
         try:
@@ -210,7 +226,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 로컬→서버 업로드 (파일 여러 개) ---
     def upload_to_dir(self, target_dir:str, local_paths:list[str], progress=None):
         metas = []
         for p in local_paths:
@@ -236,7 +251,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 로컬→서버 업로드 (트리: 파일/폴더 혼합) ---
     def upload_tree_to(self, target_dir:str, local_paths:list[str], progress=None):
         entries = []
         for p in local_paths:
@@ -271,7 +285,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 서버→로컬 다운로드 (파일만) ---
     def download_paths(self, server_paths:list[str], local_target_dir:str, progress=None):
         os.makedirs(local_target_dir, exist_ok=True)
         s = self._connect()
@@ -298,7 +311,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 서버→로컬 다운로드 (트리: 파일/폴더 혼합) ---
     def download_tree_paths(self, server_paths:list[str], local_target_dir:str, progress=None):
         os.makedirs(local_target_dir, exist_ok=True)
         s = self._connect()
@@ -325,7 +337,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 서버→로컬 ZIP 다운로드 ---
     def download_paths_as_zip(self, server_paths:list[str], local_target_dir:str, zip_name:str|None=None, progress=None):
         os.makedirs(local_target_dir, exist_ok=True)
         s = self._connect()
@@ -350,10 +361,8 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 로컬 ZIP 생성 후 업로드 ---
     def upload_zip_of_local(self, target_dir:str, src_paths:list[str], zip_name:str|None=None, progress=None):
         if not src_paths: return (False, "no source")
-        # 임시 ZIP 생성
         tmp_dir = tempfile.gettempdir()
         if not zip_name:
             base = os.path.basename(os.path.abspath(src_paths[0])).rstrip("\\/")
@@ -373,7 +382,6 @@ class FileClient:
                                 rel_sub = os.path.relpath(fp, p)
                                 arc = os.path.join(base, rel_sub)
                                 zf.write(fp, arcname=arc)
-            # ZIP 1개 업로드
             return self.upload_to_dir(target_dir, [zpath], progress=progress)
         finally:
             try:
@@ -404,9 +412,7 @@ class ViewerLabel(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.keep_aspect = True
         self.remote_size = (0,0)
-    def set_keep_aspect(self, on:bool): self.keep_aspect = on
     def set_remote_size(self, w:int, h:int): self.remote_size = (w,h)
     def map_to_remote(self, p: QPoint) -> tuple[int,int]:
         rw, rh = self.remote_size
@@ -431,22 +437,49 @@ class ViewerLabel(QLabel):
         self.sig_mouse.emit({"t":"up","btn":btn,"x":e.position().x(),"y":e.position().y()})
     def wheelEvent(self, e): self.sig_mouse.emit({"t":"wheel","delta":e.angleDelta().y()})
 
-# ===== 파일 목록 위젯 =====
-class FileList(QListWidget):
+# ===== 파일 테이블 위젯(탐색기 스타일) =====
+class FileTable(QTreeWidget):
     sig_copy = Signal()
     sig_paste = Signal()
     def __init__(self):
         super().__init__()
-        self.setSelectionMode(QListWidget.ExtendedSelection)
-        self.setUniformItemSizes(True)
+        self.setColumnCount(4)
+        self.setHeaderLabels(["이름", "수정 날짜", "유형", "크기"])
+        self.header().setStretchLastSection(False)
+        self.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.setSortingEnabled(True)
+        self.setRootIsDecorated(False)
         self.setAlternatingRowColors(True)
-        self.setStyleSheet("QListWidget{font-size:12px;}")
+        self.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.dir_icon = self.style().standardIcon(QStyle.SP_DirIcon)
+        self.file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
+        self.setUniformRowHeights(True)
+
     def keyPressEvent(self, e):
         if (e.modifiers() & Qt.ControlModifier) and e.key()==Qt.Key_C:
             self.sig_copy.emit(); return
         if (e.modifiers() & Qt.ControlModifier) and e.key()==Qt.Key_V:
             self.sig_paste.emit(); return
         super().keyPressEvent(e)
+
+    def add_entry(self, name:str, is_dir:bool, full_path:str, size:int|None, mtime:float|None):
+        # 유형/크기/날짜 문자열
+        ftype = "폴더" if is_dir else (f"{os.path.splitext(name)[1][1:].upper()} 파일" if os.path.splitext(name)[1] else "파일")
+        size_str = "" if is_dir else human_size(size or 0)
+        mtime_str = fmt_mtime(mtime)
+        it = QTreeWidgetItem([name, mtime_str, ftype, size_str])
+        it.setData(0, Qt.UserRole, {"name": name, "is_dir": is_dir, "path": full_path})
+        it.setIcon(0, self.dir_icon if is_dir else self.file_icon)
+        # 정렬용 데이터(숫자/시간)
+        it.setData(1, Qt.UserRole+1, mtime or 0.0)
+        it.setData(3, Qt.UserRole+1, size or (0 if is_dir else 0))
+        # 크기 오른쪽 정렬
+        it.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
+        self.addTopLevelItem(it)
+        return it
 
 # ===== 전송 작업 스레드 =====
 class TransferThread(QThread):
@@ -477,20 +510,20 @@ class FileTransferPage(QWidget):
         self.ed_left = QLineEdit(); self.ed_left.setReadOnly(True)
         self.btn_left_send = QPushButton("전달"); self.btn_left_zip = QPushButton("ZIP으로 전달")
         self.btn_left_send.setEnabled(False); self.btn_left_zip.setEnabled(False)
-        self.left_list = FileList()
-        self.left_list.sig_copy.connect(self.copy_from_server)
-        self.left_list.sig_paste.connect(self.paste_to_server)
-        self.left_list.itemSelectionChanged.connect(self.update_buttons)
+        self.left_table = FileTable()
+        self.left_table.sig_copy.connect(self.copy_from_server)
+        self.left_table.sig_paste.connect(self.paste_to_server)
+        self.left_table.itemSelectionChanged.connect(self.update_buttons)
 
         # 우(로컬)
         self.lbl_right = QLabel("클라이언트 경로:")
         self.ed_right = QLineEdit(); self.ed_right.setReadOnly(True)
         self.btn_right_send = QPushButton("전달"); self.btn_right_zip = QPushButton("ZIP으로 전달")
         self.btn_right_send.setEnabled(False); self.btn_right_zip.setEnabled(False)
-        self.right_list = FileList()
-        self.right_list.sig_copy.connect(self.copy_from_local)
-        self.right_list.sig_paste.connect(self.paste_to_local)
-        self.right_list.itemSelectionChanged.connect(self.update_buttons)
+        self.right_table = FileTable()
+        self.right_table.sig_copy.connect(self.copy_from_local)
+        self.right_table.sig_paste.connect(self.paste_to_local)
+        self.right_table.itemSelectionChanged.connect(self.update_buttons)
 
         # 버튼 동작 연결
         self.btn_left_send.clicked.connect(self.on_left_send)
@@ -501,8 +534,8 @@ class FileTransferPage(QWidget):
         # 레이아웃(헤더)
         header_l = QHBoxLayout(); header_l.addWidget(self.lbl_left); header_l.addWidget(self.ed_left, 1); header_l.addWidget(self.btn_left_send); header_l.addWidget(self.btn_left_zip)
         header_r = QHBoxLayout(); header_r.addWidget(self.lbl_right); header_r.addWidget(self.ed_right, 1); header_r.addWidget(self.btn_right_send); header_r.addWidget(self.btn_right_zip)
-        left_wrap = QVBoxLayout(); left_wrap.addLayout(header_l); left_wrap.addWidget(self.left_list, 1)
-        right_wrap = QVBoxLayout(); right_wrap.addLayout(header_r); right_wrap.addWidget(self.right_list, 1)
+        left_wrap = QVBoxLayout(); left_wrap.addLayout(header_l); left_wrap.addWidget(self.left_table, 1)
+        right_wrap = QVBoxLayout(); right_wrap.addLayout(header_r); right_wrap.addWidget(self.right_table, 1)
         left_w = QWidget(); left_w.setLayout(left_wrap)
         right_w = QWidget(); right_w.setLayout(right_wrap)
         spl = QSplitter(); spl.addWidget(left_w); spl.addWidget(right_w); spl.setSizes([600, 600])
@@ -522,69 +555,108 @@ class FileTransferPage(QWidget):
         self.refresh_local(self.local_cwd)
 
         # 더블클릭 탐색
-        self.left_list.itemDoubleClicked.connect(self.on_double_left)
-        self.right_list.itemDoubleClicked.connect(self.on_double_right)
+        self.left_table.itemDoubleClicked.connect(self.on_double_left)
+        self.right_table.itemDoubleClicked.connect(self.on_double_right)
+
+    # 상태 질의/대기 (스레드 안전 종료용)
+    def has_running_transfer(self) -> bool:
+        return (self._xfer_thread is not None) and self._xfer_thread.isRunning()
+
+    def wait_transfer_finish(self, timeout_ms: int | None = None):
+        if self._xfer_thread is not None:
+            if timeout_ms is None:
+                self._xfer_thread.wait()
+            else:
+                self._xfer_thread.wait(timeout_ms)
 
     # --- 목록 갱신 ---
     def refresh_server(self, path: str|None):
         resp = self.fc.list_dir_server(path)
+        self.left_table.clear()
         if not resp.get("ok"):
-            self.left_list.clear(); self.ed_left.setText(resp.get("error","에러")); return
+            self.ed_left.setText(resp.get("error","에러")); return
         self.server_cwd = resp["path"]; self.ed_left.setText(self.server_cwd)
-        self.left_list.clear()
+
+        # 상위 폴더
         up = os.path.dirname(self.server_cwd)
         if up and up != self.server_cwd:
-            it = QListWidgetItem(".."); it.setData(Qt.UserRole, {"name":"..","is_dir":True,"path": up})
-            self.left_list.addItem(it)
-        for m in sorted(resp["items"], key=lambda x:(not x["is_dir"], x["name"].lower())):
-            it = QListWidgetItem(("[D] " if m["is_dir"] else "[F] ")+m["name"])
-            it.setData(Qt.UserRole, {"name":m["name"],"is_dir":m["is_dir"],"path": os.path.join(self.server_cwd, m["name"])})
-            self.left_list.addItem(it)
+            it = self.left_table.add_entry("..", True, up, None, None)
+            it.setForeground(0, self.palette().brush(self.foregroundRole()))
+
+        # 항목 채우기
+        items = resp.get("items", [])
+        # 디렉터리 우선 정렬
+        items.sort(key=lambda x:(not x.get("is_dir",False), x.get("name","").lower()))
+        for m in items:
+            full = os.path.join(self.server_cwd, m["name"])
+            self.left_table.add_entry(m["name"], bool(m["is_dir"]), full, int(m.get("size",0)), float(m.get("mtime",0)))
+
+        self.left_table.sortItems(0, Qt.AscendingOrder)
 
     def refresh_local(self, path: str):
-        path = os.path.abspath(path); self.local_cwd = path; self.ed_right.setText(self.local_cwd); self.right_list.clear()
+        path = os.path.abspath(path)
+        self.local_cwd = path; self.ed_right.setText(self.local_cwd)
+        self.right_table.clear()
+
+        # 상위 폴더
         up = os.path.dirname(self.local_cwd)
         if up and up != self.local_cwd:
-            it = QListWidgetItem(".."); it.setData(Qt.UserRole, {"name":"..","is_dir":True,"path": up})
-            self.right_list.addItem(it)
+            it = self.right_table.add_entry("..", True, up, None, None)
+            it.setForeground(0, self.palette().brush(self.foregroundRole()))
+
         try:
             with os.scandir(self.local_cwd) as iters:
-                for e in sorted(iters, key=lambda x:(not x.is_dir(), x.name.lower())):
-                    meta = {"name":e.name,"is_dir":e.is_dir(),"path": os.path.join(self.local_cwd, e.name)}
-                    item = QListWidgetItem(("[D] " if e.is_dir() else "[F] ")+e.name)
-                    item.setData(Qt.UserRole, meta); self.right_list.addItem(item)
+                entries = []
+                for e in iters:
+                    try:
+                        st = e.stat()
+                        entries.append({
+                            "name": e.name,
+                            "is_dir": e.is_dir(),
+                            "size": int(st.st_size),
+                            "mtime": float(st.st_mtime)
+                        })
+                    except Exception:
+                        pass
+            entries.sort(key=lambda x:(not x["is_dir"], x["name"].lower()))
+            for m in entries:
+                full = os.path.join(self.local_cwd, m["name"])
+                self.right_table.add_entry(m["name"], bool(m["is_dir"]), full, int(m.get("size",0)), float(m.get("mtime",0)))
+            self.right_table.sortItems(0, Qt.AscendingOrder)
         except Exception as ex:
-            self.right_list.addItem(QListWidgetItem(f"[ERROR] {ex!s}"))
+            self.right_table.addTopLevelItem(QTreeWidgetItem([f"[ERROR] {ex!s}","","",""]))
 
     # --- 더블클릭 이동 ---
-    def on_double_left(self, item: QListWidgetItem):
-        meta = item.data(Qt.UserRole)
-        if meta and meta.get("is_dir"):
+    def on_double_left(self, item: QTreeWidgetItem):
+        meta = item.data(0, Qt.UserRole)
+        if not meta: return
+        if meta.get("is_dir"):  # 파일 더블클릭은 무시
             self.refresh_server(meta["path"])
 
-    def on_double_right(self, item: QListWidgetItem):
-        meta = item.data(Qt.UserRole)
-        if meta and meta.get("is_dir"):
+    def on_double_right(self, item: QTreeWidgetItem):
+        meta = item.data(0, Qt.UserRole)
+        if not meta: return
+        if meta.get("is_dir"):
             self.refresh_local(meta["path"])
 
     # --- 버튼 활성화 갱신 ---
     def update_buttons(self):
-        def has_valid(sel_items):
-            for it in sel_items:
-                meta = it.data(Qt.UserRole)
+        def has_valid(items):
+            for it in items:
+                meta = it.data(0, Qt.UserRole)
                 if meta and meta.get("name") != "..":
                     return True
             return False
-        self.btn_left_send.setEnabled(has_valid(self.left_list.selectedItems()))
-        self.btn_left_zip.setEnabled(has_valid(self.left_list.selectedItems()))
-        self.btn_right_send.setEnabled(has_valid(self.right_list.selectedItems()))
-        self.btn_right_zip.setEnabled(has_valid(self.right_list.selectedItems()))
+        self.btn_left_send.setEnabled(has_valid(self.left_table.selectedItems()))
+        self.btn_left_zip.setEnabled(has_valid(self.left_table.selectedItems()))
+        self.btn_right_send.setEnabled(has_valid(self.right_table.selectedItems()))
+        self.btn_right_zip.setEnabled(has_valid(self.right_table.selectedItems()))
 
-    # --- 복사/붙여넣기 (기존 기능 유지) ---
+    # --- 복사/붙여넣기 (기존: 파일만) ---
     def copy_from_server(self):
         paths = []
-        for it in self.left_list.selectedItems():
-            meta = it.data(Qt.UserRole)
+        for it in self.left_table.selectedItems():
+            meta = it.data(0, Qt.UserRole)
             if meta and meta.get("name")!=".." and not meta.get("is_dir"):
                 paths.append(meta["path"])
         if not paths:
@@ -595,14 +667,13 @@ class FileTransferPage(QWidget):
     def paste_to_server(self):
         if not self.clip or self.clip.get("type")!="local":
             self.window().statusBar().showMessage("로컬에서 복사(Ctrl+C) 후 서버 창에 붙여넣기(Ctrl+V).", 3000); return
-        # 파일만 업로드
         self.run_transfer(lambda cb: self.fc.upload_to_dir(self.server_cwd, self.clip["paths"], progress=cb),
                           after=lambda ok: self.refresh_server(self.server_cwd))
 
     def copy_from_local(self):
         paths = []
-        for it in self.right_list.selectedItems():
-            meta = it.data(Qt.UserRole)
+        for it in self.right_table.selectedItems():
+            meta = it.data(0, Qt.UserRole)
             if meta and meta.get("name")!=".." and not meta.get("is_dir"):
                 paths.append(meta["path"])
         if not paths:
@@ -616,53 +687,45 @@ class FileTransferPage(QWidget):
         self.run_transfer(lambda cb: self.fc.download_paths(self.clip["paths"], self.local_cwd, progress=cb),
                           after=lambda ok: self.refresh_local(self.local_cwd))
 
-    # --- 전달 버튼 동작 ---
+    # --- 전달 버튼 동작(폴더 포함) ---
+    def _selected_paths(self, table: FileTable):
+        return [it.data(0, Qt.UserRole)["path"] for it in table.selectedItems()
+                if it.data(0, Qt.UserRole) and it.data(0, Qt.UserRole)["name"]!=".."]
+
     def on_left_send(self):
-        # 서버 선택 → 클라이언트 현재 폴더 (폴더 포함 트리)
-        sel = [it.data(Qt.UserRole)["path"] for it in self.left_list.selectedItems()
-               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        sel = self._selected_paths(self.left_table)
         if not sel: return
         self.run_transfer(lambda cb: self.fc.download_tree_paths(sel, self.local_cwd, progress=cb),
                           after=lambda ok: self.refresh_local(self.local_cwd))
 
     def on_left_zip(self):
-        # 서버 선택 → 클라이언트 현재 폴더 (서버에서 ZIP 생성)
-        sel = [it.data(Qt.UserRole)["path"] for it in self.left_list.selectedItems()
-               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        sel = self._selected_paths(self.left_table)
         if not sel: return
         self.run_transfer(lambda cb: self.fc.download_paths_as_zip(sel, self.local_cwd, zip_name=None, progress=cb),
                           after=lambda ok: self.refresh_local(self.local_cwd))
 
     def on_right_send(self):
-        # 클라이언트 선택 → 서버 현재 폴더 (폴더 포함 트리)
-        sel = [it.data(Qt.UserRole)["path"] for it in self.right_list.selectedItems()
-               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        sel = self._selected_paths(self.right_table)
         if not sel: return
         self.run_transfer(lambda cb: self.fc.upload_tree_to(self.server_cwd, sel, progress=cb),
                           after=lambda ok: self.refresh_server(self.server_cwd))
 
     def on_right_zip(self):
-        # 클라이언트 선택 → 서버 현재 폴더 (클라이언트에서 ZIP 생성 후 업로드)
-        sel = [it.data(Qt.UserRole)["path"] for it in self.right_list.selectedItems()
-               if it.data(Qt.UserRole) and it.data(Qt.UserRole)["name"]!=".."]
+        sel = self._selected_paths(self.right_table)
         if not sel: return
         self.run_transfer(lambda cb: self.fc.upload_zip_of_local(self.server_cwd, sel, zip_name=None, progress=cb),
                           after=lambda ok: self.refresh_server(self.server_cwd))
 
-    # --- 전송 실행/진행률 UI ---
+    # --- 전송 실행/진행률 UI (스레드 보관/정리 포함) ---
     def run_transfer(self, op_callable, after=None):
-        # 이미 전송 중이면 중복 시작 방지
         if self.has_running_transfer():
             self.window().statusBar().showMessage("이미 전송 작업이 실행 중입니다.", 3000)
             return
-
-        # UI 잠금 및 진행률 초기화
         self.setEnabled_controls(False)
-        self.prog.setValue(0)
-        self.lbl_prog.setText("남은 100%")
+        self.prog.setValue(0); self.lbl_prog.setText("남은 100%")
 
         th = TransferThread(op_callable)
-        th.setParent(self)  # 선택: 부모 설정(수명 관리 안정화)
+        th.setParent(self)
         self._xfer_thread = th
 
         th.prog.connect(self.on_progress)
@@ -670,12 +733,9 @@ class FileTransferPage(QWidget):
         def on_done(ok, msg):
             try:
                 self.on_finish(ok, msg)
-                if after:
-                    after(ok)
+                if after: after(ok)
             finally:
-                # 스레드 정리
                 self.setEnabled_controls(True)
-                # Qt 객체 해제 지연 예약(선택)
                 th.deleteLater()
                 self._xfer_thread = None
 
@@ -683,7 +743,7 @@ class FileTransferPage(QWidget):
         th.start()
 
     def setEnabled_controls(self, enabled: bool):
-        for w in [self.left_list, self.right_list, self.btn_left_send, self.btn_left_zip, self.btn_right_send, self.btn_right_zip]:
+        for w in [self.left_table, self.right_table, self.btn_left_send, self.btn_left_zip, self.btn_right_send, self.btn_right_zip]:
             w.setEnabled(enabled)
 
     def on_progress(self, done:int, total:int):
@@ -698,17 +758,6 @@ class FileTransferPage(QWidget):
         else:
             self.lbl_prog.setText("전송 실패")
             self.window().statusBar().showMessage("전송 실패: " + msg, 5000)
-    
-    def has_running_transfer(self) -> bool:
-        return (self._xfer_thread is not None) and self._xfer_thread.isRunning()
-
-    def wait_transfer_finish(self, timeout_ms: int | None = None):
-        """timeout_ms=None 또는 생략 시 무기한 대기, 정수면 해당 ms 만큼 대기"""
-        if self._xfer_thread is not None:
-            if timeout_ms is None:
-                self._xfer_thread.wait()
-            else:
-                self._xfer_thread.wait(timeout_ms)
 
 # ===== 간단 스택 위젯 =====
 class QStackedWidgetSafe(QWidget):
@@ -795,7 +844,6 @@ class ClientWindow(QMainWindow):
 
     def redraw(self, qimg:QImage):
         pm = QPixmap.fromImage(qimg)
-        self.view.set_keep_aspect(True)
         scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.view.setPixmap(scaled)
 
@@ -860,30 +908,24 @@ class ClientWindow(QMainWindow):
         self.page_transfer.refresh_server(None)
 
     def closeEvent(self, e):
-        # 파일 전송 스레드가 돌고 있으면 먼저 종료 대기
+        # 전송 스레드가 동작 중이면 먼저 대기
         try:
             if hasattr(self, "page_transfer") and self.page_transfer and \
-            hasattr(self.page_transfer, "has_running_transfer") and \
-            self.page_transfer.has_running_transfer():
+               hasattr(self.page_transfer, "has_running_transfer") and \
+               self.page_transfer.has_running_transfer():
                 self.statusBar().showMessage("파일 전송 마무리 중입니다. 잠시만 기다려주세요...", 3000)
-                # 무기한 대기(안전): self.page_transfer.wait_transfer_finish()
-                # 또는 제한 대기(예: 15초)
                 self.page_transfer.wait_transfer_finish(15000)
                 if self.page_transfer.has_running_transfer():
-                    # 아직 끝나지 않았다면 종료를 막고 사용자에게 알림
                     QMessageBox.warning(self, "알림", "파일 전송이 진행 중입니다. 전송 완료 후 종료해 주세요.")
                     e.ignore()
                     return
         except Exception:
             pass
-
-        # ↓ 기존 종료 처리(영상/제어 스레드 정리)는 그대로 유지
         try:
             self.vc.stop(); self.vc.wait(1000)
         except Exception:
             pass
         super().closeEvent(e)
-
 
 def main():
     server_ip = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
