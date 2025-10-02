@@ -194,39 +194,90 @@ class FileClient:
         finally:
             s.close()
     # 서버 클립보드 → 로컬 저장
+    # client_main.py 내 FileClient 클래스의 download_from_server_clip() 교체
     def download_from_server_clip(self, target_dir: str | None):
-        if not target_dir or not os.path.isdir(target_dir):
-            # 폴백 디렉터리
-            base = os.path.join(os.path.expanduser("~"), "Downloads")
-            target_dir = os.path.join(base, "RemoteFromServer")
-        os.makedirs(target_dir, exist_ok=True)
+        import tempfile
+
+        def _writable_dir(d: str) -> bool:
+            try:
+                os.makedirs(d, exist_ok=True)
+                # 임시 파일 생성/삭제로 실제 쓰기 가능 여부 검증
+                fd, tmp = tempfile.mkstemp(dir=d)
+                os.close(fd)
+                os.remove(tmp)
+                return True
+            except Exception:
+                return False
+
+        # 1) 폴더 결정: 활성 폴더가 유효하고 쓰기 가능하면 사용, 아니면 폴백
+        if target_dir and os.path.isdir(target_dir) and _writable_dir(target_dir):
+            base_dir = target_dir
+        else:
+            base_default = os.path.join(os.path.expanduser("~"), "Downloads")
+            base_dir = os.path.join(base_default, "RemoteFromServer")
+            os.makedirs(base_dir, exist_ok=True)
+
+        # 2) 서버 접속 후 헤더 수신
         s = self._connect()
         try:
             req = json.dumps({"cmd":"download_clip"}).encode("utf-8")
             s.sendall(struct.pack(">I", len(req)) + req)
-            # 헤더
+
             jlen_b = recv_exact(s, 4)
-            if not jlen_b: return False, "서버 응답 없음", []
+            if not jlen_b:
+                return False, "서버 응답 없음", []
             jlen = struct.unpack(">I", jlen_b)[0]
             head = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
             files = head.get("files", [])
             if not files:
                 return False, "서버 클립보드에 파일이 없습니다.", []
-            saved=[]
+
+            saved_paths = []
+            # 3) 각 파일 본문 수신/저장 (개별 실패 시 폴백 디렉터리로 재시도)
             for m in files:
                 name = os.path.basename(m.get("name","file"))
                 size = int(m.get("size",0))
-                dst  = os.path.join(target_dir, name)
-                with open(dst, "wb") as f:
-                    remain=size
-                    while remain>0:
+                remain = size
+
+                # 기본 저장 경로
+                dst_dir = base_dir
+                dst = os.path.join(dst_dir, name)
+
+                # 첫 시도: base_dir
+                try:
+                    # 열기 시점에 권한/경로 오류 검증
+                    f = open(dst, "wb")
+                except Exception:
+                    # 폴백 디렉터리 강제 사용
+                    fb_root = os.path.join(os.path.expanduser("~"), "Downloads", "RemoteFromServer")
+                    os.makedirs(fb_root, exist_ok=True)
+                    dst_dir = fb_root
+                    dst = os.path.join(dst_dir, name)
+                    f = open(dst, "wb")
+
+                # 스트림은 끝까지 반드시 소비(프로토콜 정합성)
+                try:
+                    with f:
+                        while remain > 0:
+                            chunk = s.recv(min(1024*256, remain))
+                            if not chunk:
+                                raise ConnectionError("file stream interrupted")
+                            f.write(chunk)
+                            remain -= len(chunk)
+                    saved_paths.append(dst)
+                except Exception:
+                    # 실패하더라도 남은 바이트는 모두 읽어서 다음 파일에 영향 없도록 함
+                    while remain > 0:
                         chunk = s.recv(min(1024*256, remain))
-                        if not chunk: raise ConnectionError("file stream interrupted")
-                        f.write(chunk); remain -= len(chunk)
-                saved.append(dst)
-            return True, target_dir, saved
+                        if not chunk:
+                            break
+                        remain -= len(chunk)
+                    # 이 파일은 스킵(저장 실패)
+
+            return (len(saved_paths) > 0), (base_dir if saved_paths else ""), saved_paths
         finally:
             s.close()
+
     # 로컬 클립보드 → 서버 저장
     def upload_local_clip_to_server(self, target_dir: str | None):
         cb = QGuiApplication.clipboard(); md = cb.mimeData()
@@ -392,12 +443,13 @@ class ClientWindow(QMainWindow):
                     self.statusBar().showMessage(f"서버에 저장됨: {saved_dir}", 4000)
                     return
             # (B) 로컬에 파일이 없으면 → 서버 클립보드에서 내려받아 로컬 활성 폴더로 저장
+            # client_main.py, ClientWindow.keyPressEvent() 의 서버→클라이언트 분기 부분
             local_dir = get_local_active_explorer_folder()
             ok_down, saved_dir, saved_paths = self.fc.download_from_server_clip(local_dir or None)
             if ok_down and saved_paths:
-                # 로컬 탐색기 갱신(F5) 시도: (로컬 키 주입 대신 사용자 환경에 맡김)
-                self.statusBar().showMessage(f"로컬에 저장됨: {saved_dir}", 4000)
+                self.statusBar().showMessage(f"서버 → 로컬 저장 완료: {saved_dir} ({len(saved_paths)}개)", 5000)
                 return
+
             # (C) 둘 다 아니면 일반 Ctrl+V 전달
             self.cc.send_key(VK["CTRL"], True); self.cc.send_key(ord('V'), True)
             self.cc.send_key(ord('V'), False); self.cc.send_key(VK["CTRL"], False)

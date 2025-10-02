@@ -1,5 +1,10 @@
-# server_main.py
 import sys, time, socket, select, threading, struct, json, os, ctypes
+try:
+    import win32clipboard, win32con
+except Exception:
+    win32clipboard = None
+    win32con = None
+
 import numpy as np
 import cv2
 from mss import mss
@@ -273,21 +278,63 @@ class FileServer(QThread):
             saved_paths.append(dst)
         ack = json.dumps({"ok": True, "saved_dir": save_dir, "saved_paths": saved_paths}).encode("utf-8")
         sock.sendall(struct.pack(">I", len(ack)) + ack)
+        
     def _handle_download_clip(self, sock):
-        cb = QGuiApplication.clipboard(); md = cb.mimeData(); urls = md.urls() if md else []
-        paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
-        metas=[]
+        """
+        서버 클립보드에서 파일 목록/본문을 안정적으로 읽어 스트리밍.
+        1) 우선 Win32 API(CF_HDROP)로 직접 읽기
+        2) 실패 시 Qt QClipboard 폴백
+        """
+        paths = []
+
+        # --- 1) Win32 API 경로 (권장, 가장 안정적) ---
+        if win32clipboard is not None and win32con is not None:
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                        hdrops = win32clipboard.GetClipboardData(win32con.CF_HDROP)  # list of file paths
+                        if hdrops:
+                            # 일부 환경에서 tuple로 올 수 있으니 리스트화
+                            paths = [str(p) for p in hdrops]
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                # Win32 경로 실패 시 아래 Qt 폴백 진행
+                pass
+
+        # --- 2) Qt 폴백 ---
+        if not paths:
+            cb = QGuiApplication.clipboard()
+            md = cb.mimeData()
+            urls = md.urls() if md else []
+            paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
+
+        # 헤더 송신 (파일 메타)
+        metas = []
         for p in paths:
-            try: metas.append({"name": os.path.basename(p), "size": int(os.path.getsize(p)), "path": p})
-            except Exception: pass
-        head = json.dumps({"cmd":"download_clip","files":[{"name":m["name"],"size":m["size"]} for m in metas]}).encode("utf-8")
+            try:
+                size = os.path.getsize(p)
+                metas.append({"name": os.path.basename(p), "size": int(size), "path": p})
+            except Exception:
+                # 접근 불가/삭제된 항목은 스킵
+                pass
+
+        head = json.dumps({
+            "cmd": "download_clip",
+            "files": [{"name": m["name"], "size": m["size"]} for m in metas]
+        }).encode("utf-8")
         sock.sendall(struct.pack(">I", len(head)) + head)
+
+        # 본문 스트리밍
         for m in metas:
             with open(m["path"], "rb") as f:
                 while True:
-                    buf = f.read(1024*256)
-                    if not buf: break
+                    buf = f.read(1024 * 256)
+                    if not buf:
+                        break
                     sock.sendall(buf)
+
 
 # ====== 서버 윈도우 ======
 class ServerWindow(QMainWindow):
