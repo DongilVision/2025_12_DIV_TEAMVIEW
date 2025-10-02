@@ -1,5 +1,5 @@
 # server_main.py
-import sys, time, socket, select, threading, struct, json, os, ctypes
+import sys, time, socket, select, threading, struct, json, os, ctypes, tempfile, zipfile
 import numpy as np
 import cv2
 from mss import mss
@@ -215,11 +215,26 @@ class FileServer(QThread):
     """
     프로토콜(요청/응답 모두 JSON 길이프리픽스):
     - {"cmd":"ls","path": "<abs or empty>"} → {"ok":true,"path": "<norm abs>", "items":[{"name":..., "is_dir":bool, "size":int, "mtime":float}]}
-    - {"cmd":"upload_to","target_dir":"<abs>","files":[{"name":..., "size":...}, ...]} + [본문 스트림...]
+
+    - 업로드(단일 또는 여러 파일):
+      {"cmd":"upload_to","target_dir":"<abs>","files":[{"name":..., "size":...}, ...]} + [본문 스트림...]
       → {"ok":true,"saved":[ "<abs>", ... ]}
-    - {"cmd":"download_paths","paths":[ "<abs>", ... ]}
-      → 먼저 {"ok":true,"files":[{"name":..., "size":...}, ...]} 후 본문 스트림 연속 전송
-    (기존 download_clip, upload 등은 생략해도 무방하나 남겨둬도 문제 없음)
+
+    - 업로드(트리: 파일/폴더 혼합)
+      {"cmd":"upload_tree_to","target_dir":"<abs>","files":[{"rel":"sub\\a.txt","size":...}, ...]} + [본문 스트림...]
+      → {"ok":true,"saved_root":"<abs>"}
+
+    - 다운로드(파일만):
+      {"cmd":"download_paths","paths":[ "<abs>", ... ]}
+      → {"ok":true,"files":[{"name":..., "size":...}, ...]} + [본문 스트림...]
+
+    - 다운로드(트리: 파일/폴더 혼합)
+      {"cmd":"download_tree_paths","paths":[ "<abs>", ... ]}
+      → {"ok":true,"files":[{"rel":"Top\\sub\\a.txt","size":...}, ...]} + [본문 스트림...]
+
+    - 서버 ZIP 생성 후 단일 파일 전송
+      {"cmd":"download_paths_as_zip","paths":[...], "zip_name":"optional.zip"}
+      → {"ok":true,"zip_name":"...", "size":N} + [ZIP 스트림...]
     """
     def __init__(self, host: str, port: int):
         super().__init__()
@@ -257,8 +272,14 @@ class FileServer(QThread):
                 self._handle_ls(sock, req)
             elif cmd == "upload_to":
                 self._handle_upload_to(sock, req)
+            elif cmd == "upload_tree_to":
+                self._handle_upload_tree_to(sock, req)
             elif cmd == "download_paths":
                 self._handle_download_paths(sock, req)
+            elif cmd == "download_tree_paths":
+                self._handle_download_tree_paths(sock, req)
+            elif cmd == "download_paths_as_zip":
+                self._handle_download_paths_as_zip(sock, req)
         except Exception:
             pass
         finally:
@@ -309,6 +330,29 @@ class FileServer(QThread):
         except Exception as ex:
             send_json(sock, {"ok": False, "error": str(ex)})
 
+    def _handle_upload_tree_to(self, sock, req):
+        target_dir = req.get("target_dir","")
+        files = req.get("files", [])
+        try:
+            if not target_dir: raise ValueError("target_dir required")
+            target_dir = os.path.abspath(target_dir)
+            os.makedirs(target_dir, exist_ok=True)
+            for m in files:
+                rel  = m.get("rel","")
+                size = int(m.get("size",0))
+                if not rel: raise ValueError("rel required")
+                dst = os.path.join(target_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "wb") as f:
+                    remain = size
+                    while remain > 0:
+                        chunk = sock.recv(min(1024*256, remain))
+                        if not chunk: raise ConnectionError("file stream interrupted")
+                        f.write(chunk); remain -= len(chunk)
+            send_json(sock, {"ok": True, "saved_root": target_dir})
+        except Exception as ex:
+            send_json(sock, {"ok": False, "error": str(ex)})
+
     def _handle_download_paths(self, sock, req):
         paths = [os.path.abspath(p) for p in req.get("paths",[])]
         metas = []
@@ -325,6 +369,71 @@ class FileServer(QThread):
                     buf = f.read(1024*256)
                     if not buf: break
                     sock.sendall(buf)
+
+    def _handle_download_tree_paths(self, sock, req):
+        paths = [os.path.abspath(p) for p in req.get("paths",[])]
+        files = []
+        for p in paths:
+            if os.path.isfile(p):
+                try:
+                    files.append({"rel": os.path.basename(p), "size": int(os.path.getsize(p)), "path": p})
+                except Exception:
+                    pass
+            elif os.path.isdir(p):
+                base = os.path.basename(p.rstrip("\\/")) or p
+                for root, _dirs, fnames in os.walk(p):
+                    for fn in fnames:
+                        fp = os.path.join(root, fn)
+                        try:
+                            rel_sub = os.path.relpath(fp, p)
+                            rel = os.path.join(base, rel_sub)
+                            files.append({"rel": rel, "size": int(os.path.getsize(fp)), "path": fp})
+                        except Exception:
+                            pass
+        send_json(sock, {"ok": True, "files":[{"rel":m["rel"],"size":m["size"]} for m in files]})
+        for m in files:
+            with open(m["path"], "rb") as f:
+                while True:
+                    buf = f.read(1024*256)
+                    if not buf: break
+                    sock.sendall(buf)
+
+    def _handle_download_paths_as_zip(self, sock, req):
+        paths = [os.path.abspath(p) for p in req.get("paths",[])]
+        zip_name = req.get("zip_name") or f"server_bundle_{int(time.time())}.zip"
+        # 임시 ZIP 생성
+        tmpdir = QStandardPaths.writableLocation(QStandardPaths.TempLocation) or tempfile.gettempdir()
+        os.makedirs(tmpdir, exist_ok=True)
+        zpath = os.path.join(tmpdir, zip_name)
+        try:
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in paths:
+                    if os.path.isfile(p):
+                        arc = os.path.basename(p)
+                        zf.write(p, arcname=arc)
+                    elif os.path.isdir(p):
+                        base = os.path.basename(p.rstrip("\\/")) or p
+                        for root, _dirs, fnames in os.walk(p):
+                            for fn in fnames:
+                                fp = os.path.join(root, fn)
+                                rel_sub = os.path.relpath(fp, p)
+                                arc = os.path.join(base, rel_sub)
+                                zf.write(fp, arcname=arc)
+            size = os.path.getsize(zpath)
+            send_json(sock, {"ok": True, "zip_name": zip_name, "size": int(size)})
+            with open(zpath, "rb") as f:
+                while True:
+                    buf = f.read(1024*256)
+                    if not buf: break
+                    sock.sendall(buf)
+        except Exception as ex:
+            send_json(sock, {"ok": False, "error": str(ex)})
+        finally:
+            try:
+                if os.path.exists(zpath):
+                    os.remove(zpath)
+            except Exception:
+                pass
 
 # ===== 서버 UI =====
 class ServerWindow(QMainWindow):

@@ -3,7 +3,7 @@ import sys, time, socket, struct, json, os
 import numpy as np
 import cv2
 
-from PySide6.QtCore import Qt, QThread, Signal, QPoint, QStandardPaths
+from PySide6.QtCore import Qt, QThread, Signal, QPoint
 from PySide6.QtGui import QImage, QPixmap, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
@@ -91,10 +91,10 @@ def qt_to_vk(e) -> int:
         if k == Qt.Key_8: return VK["NP8"]
         if k == Qt.Key_9: return VK["NP9"]
         if k == Qt.Key_Asterisk: return VK["NP_MUL"]
-        if k == Qt.Key_Plus: return VK["NP_ADD"]
-        if k == Qt.Key_Minus: return VK["NP_SUB"]
-        if k == Qt.Key_Slash: return VK["NP_DIV"]
-        if k == Qt.Key_Period: return VK["NP_DEC"]
+        if k == Qt.Key_Plus:     return VK["NP_ADD"]
+        if k == Qt.Key_Minus:    return VK["NP_SUB"]
+        if k == Qt.Key_Slash:    return VK["NP_DIV"]
+        if k == Qt.Key_Period:   return VK["NP_DEC"]
     if Qt.Key_0 <= k <= Qt.Key_9: return ord(str(k - Qt.Key_0))
     if Qt.Key_A <= k <= Qt.Key_Z: return ord(chr(k))
     if k == Qt.Key_Semicolon: return VK["OEM_1"]
@@ -110,7 +110,7 @@ def qt_to_vk(e) -> int:
     if k == Qt.Key_Apostrophe:   return VK["OEM_7"]
     return 0
 
-# ===== 네트워크 스레드(영상) =====
+# ===== 영상 스레드 =====
 class VideoClient(QThread):
     sig_status = Signal(float, int, bool)
     sig_frame  = Signal(QImage, int, int)
@@ -157,7 +157,7 @@ class VideoClient(QThread):
 
     def stop(self): self._stop = True
 
-# ===== 제어/키보드 송신 =====
+# ===== 제어 송신 =====
 class ControlClient:
     def __init__(self, host:str, port:int):
         self.host=host; self.port=port; self.sock=None; self.connect()
@@ -199,7 +199,6 @@ class FileClient:
         s.settimeout(5.0); s.connect((self.host, self.port)); s.settimeout(None)
         return s
 
-    # --- 서버 디렉토리 목록 ---
     def list_dir_server(self, path:str|None=None):
         s = self._connect()
         try:
@@ -210,7 +209,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 로컬→서버 업로드 (대상 디렉토리 지정) ---
     def upload_to_dir(self, target_dir:str, local_paths:list[str]):
         metas = []
         for p in local_paths:
@@ -232,7 +230,6 @@ class FileClient:
         finally:
             s.close()
 
-    # --- 서버→로컬 다운로드 (경로 배열) ---
     def download_paths(self, server_paths:list[str], local_target_dir:str):
         os.makedirs(local_target_dir, exist_ok=True)
         s = self._connect()
@@ -280,7 +277,9 @@ class ViewerLabel(QLabel):
         super().__init__(parent)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.keep_aspect = True; self.remote_size = (0,0)
+        # 항상 원격 해상도 비율 유지
+        self.keep_aspect = True
+        self.remote_size = (0,0)
     def set_keep_aspect(self, on:bool): self.keep_aspect = on
     def set_remote_size(self, w:int, h:int): self.remote_size = (w,h)
     def map_to_remote(self, p: QPoint) -> tuple[int,int]:
@@ -310,7 +309,7 @@ class ViewerLabel(QLabel):
         self.sig_mouse.emit({"t":"up","btn":btn,"x":e.position().x(),"y":e.position().y()})
     def wheelEvent(self, e): self.sig_mouse.emit({"t":"wheel","delta":e.angleDelta().y()})
 
-# ===== 파일 목록 위젯(공통 베이스) =====
+# ===== 파일 목록 위젯 =====
 class FileList(QListWidget):
     sig_copy = Signal()
     sig_paste = Signal()
@@ -320,7 +319,6 @@ class FileList(QListWidget):
         self.setUniformItemSizes(True)
         self.setAlternatingRowColors(True)
         self.setStyleSheet("QListWidget{font-size:12px;}")
-
     def keyPressEvent(self, e):
         if (e.modifiers() & Qt.ControlModifier) and e.key()==Qt.Key_C:
             self.sig_copy.emit(); return
@@ -330,12 +328,10 @@ class FileList(QListWidget):
 
 # ===== 파일 전달 페이지 =====
 class FileTransferPage(QWidget):
-    def __init__(self, fc: FileClient, parent=None):
+    def __init__(self, fc: 'FileClient', parent=None):
         super().__init__(parent)
         self.fc = fc
-        # 내부 전송 클립보드: {"type":"local"|"server", "paths":[...]}
-        self.clip = None
-
+        self.clip = None  # {"type":"local"|"server", "paths":[...]}
         # 좌(서버)
         self.lbl_left = QLabel("서버 경로:")
         self.ed_left = QLineEdit(); self.ed_left.setReadOnly(True)
@@ -348,40 +344,31 @@ class FileTransferPage(QWidget):
         self.right_list = FileList()
         self.right_list.sig_copy.connect(self.copy_from_local)
         self.right_list.sig_paste.connect(self.paste_to_local)
-
         # 레이아웃
         header_l = QHBoxLayout(); header_l.addWidget(self.lbl_left); header_l.addWidget(self.ed_left)
         header_r = QHBoxLayout(); header_r.addWidget(self.lbl_right); header_r.addWidget(self.ed_right)
         left_wrap = QVBoxLayout(); left_wrap.addLayout(header_l); left_wrap.addWidget(self.left_list, 1)
         right_wrap = QVBoxLayout(); right_wrap.addLayout(header_r); right_wrap.addWidget(self.right_list, 1)
-
         left_w = QWidget(); left_w.setLayout(left_wrap)
         right_w = QWidget(); right_w.setLayout(right_wrap)
         spl = QSplitter(); spl.addWidget(left_w); spl.addWidget(right_w); spl.setSizes([600, 600])
-
         root = QHBoxLayout(); root.setContentsMargins(8,8,8,8); root.addWidget(spl, 1)
         self.setLayout(root)
-
         # 초기 경로
         self.server_cwd = None
         self.local_cwd  = os.path.expanduser("~")
         self.refresh_server(self.server_cwd)
         self.refresh_local(self.local_cwd)
-
         # 더블클릭 탐색
         self.left_list.itemDoubleClicked.connect(self.on_double_left)
         self.right_list.itemDoubleClicked.connect(self.on_double_right)
 
-    # ---- 서버 목록 ----
     def refresh_server(self, path: str|None):
         resp = self.fc.list_dir_server(path)
         if not resp.get("ok"):
-            self.left_list.clear(); self.ed_left.setText(resp.get("error","에러"))
-            return
-        self.server_cwd = resp["path"]
-        self.ed_left.setText(self.server_cwd)
+            self.left_list.clear(); self.ed_left.setText(resp.get("error","에러")); return
+        self.server_cwd = resp["path"]; self.ed_left.setText(self.server_cwd)
         self.left_list.clear()
-        # 상위로 이동 항목
         up = os.path.dirname(self.server_cwd)
         if up and up != self.server_cwd:
             it = QListWidgetItem(".."); it.setData(Qt.UserRole, {"name":"..","is_dir":True,"path": up})
@@ -391,12 +378,8 @@ class FileTransferPage(QWidget):
             it.setData(Qt.UserRole, {"name":m["name"],"is_dir":m["is_dir"],"path": os.path.join(self.server_cwd, m["name"])})
             self.left_list.addItem(it)
 
-    # ---- 로컬 목록 ----
     def refresh_local(self, path: str):
-        path = os.path.abspath(path)
-        self.local_cwd = path
-        self.ed_right.setText(self.local_cwd)
-        self.right_list.clear()
+        path = os.path.abspath(path); self.local_cwd = path; self.ed_right.setText(self.local_cwd); self.right_list.clear()
         up = os.path.dirname(self.local_cwd)
         if up and up != self.local_cwd:
             it = QListWidgetItem(".."); it.setData(Qt.UserRole, {"name":"..","is_dir":True,"path": up})
@@ -406,64 +389,75 @@ class FileTransferPage(QWidget):
                 for e in sorted(iters, key=lambda x:(not x.is_dir(), x.name.lower())):
                     meta = {"name":e.name,"is_dir":e.is_dir(),"path": os.path.join(self.local_cwd, e.name)}
                     item = QListWidgetItem(("[D] " if e.is_dir() else "[F] ")+e.name)
-                    item.setData(Qt.UserRole, meta)
-                    self.right_list.addItem(item)
+                    item.setData(Qt.UserRole, meta); self.right_list.addItem(item)
         except Exception as ex:
             self.right_list.addItem(QListWidgetItem(f"[ERROR] {ex!s}"))
 
-    # ---- 더블클릭 이동 ----
     def on_double_left(self, item: QListWidgetItem):
         meta = item.data(Qt.UserRole)
-        if meta and meta.get("is_dir"):
-            self.refresh_server(meta["path"])
+        if meta and meta.get("is_dir"): self.refresh_server(meta["path"])
 
     def on_double_right(self, item: QListWidgetItem):
         meta = item.data(Qt.UserRole)
-        if meta and meta.get("is_dir"):
-            self.refresh_local(meta["path"])
+        if meta and meta.get("is_dir"): self.refresh_local(meta["path"])
 
-    # ---- 복사/붙여넣기 동작 ----
     def copy_from_server(self):
         paths = []
         for it in self.left_list.selectedItems():
-            meta = it.data(Qt.UserRole); 
+            meta = it.data(Qt.UserRole)
             if meta and not meta.get("is_dir"): paths.append(meta["path"])
         if not paths:
-            self.parent().statusBar().showMessage("서버: 파일을 선택하세요(폴더 제외).", 3000); return
+            self.window().statusBar().showMessage("서버: 파일을 선택하세요(폴더 제외).", 3000); return
         self.clip = {"type":"server", "paths": paths}
-        self.parent().statusBar().showMessage(f"서버에서 {len(paths)}개 복사됨.", 3000)
+        self.window().statusBar().showMessage(f"서버에서 {len(paths)}개 복사됨.", 3000)
 
     def paste_to_server(self):
-        # 로컬 클립보드(내부) → 서버 현재 폴더로 업로드
         if not self.clip or self.clip.get("type")!="local":
-            self.parent().statusBar().showMessage("로컬에서 복사(Ctrl+C)한 뒤 서버 창에 붙여넣기(Ctrl+V) 하세요.", 3000); return
+            self.window().statusBar().showMessage("로컬에서 복사(Ctrl+C) 후 서버 창에 붙여넣기(Ctrl+V).", 3000); return
         res = self.fc.upload_to_dir(self.server_cwd, self.clip["paths"])
         if res.get("ok"):
             self.refresh_server(self.server_cwd)
-            self.parent().statusBar().showMessage(f"업로드 완료: {len(res.get('saved',[]))}개", 3000)
+            self.window().statusBar().showMessage(f"업로드 완료: {len(res.get('saved',[]))}개", 3000)
         else:
-            self.parent().statusBar().showMessage("업로드 실패: "+res.get("error",""), 5000)
+            self.window().statusBar().showMessage("업로드 실패: "+res.get("error",""), 5000)
 
     def copy_from_local(self):
         paths = []
         for it in self.right_list.selectedItems():
-            meta = it.data(Qt.UserRole); 
+            meta = it.data(Qt.UserRole)
             if meta and not meta.get("is_dir"): paths.append(meta["path"])
         if not paths:
-            self.parent().statusBar().showMessage("클라이언트: 파일을 선택하세요(폴더 제외).", 3000); return
+            self.window().statusBar().showMessage("클라이언트: 파일을 선택하세요(폴더 제외).", 3000); return
         self.clip = {"type":"local", "paths": paths}
-        self.parent().statusBar().showMessage(f"클라이언트에서 {len(paths)}개 복사됨.", 3000)
+        self.window().statusBar().showMessage(f"클라이언트에서 {len(paths)}개 복사됨.", 3000)
 
     def paste_to_local(self):
-        # 서버 클립보드(내부) → 로컬 현재 폴더로 다운로드
         if not self.clip or self.clip.get("type")!="server":
-            self.parent().statusBar().showMessage("서버에서 복사(Ctrl+C)한 뒤 클라이언트 창에 붙여넣기(Ctrl+V) 하세요.", 3000); return
+            self.window().statusBar().showMessage("서버에서 복사(Ctrl+C) 후 클라이언트 창에 붙여넣기(Ctrl+V).", 3000); return
         res = self.fc.download_paths(self.clip["paths"], self.local_cwd)
         if res.get("ok"):
             self.refresh_local(self.local_cwd)
-            self.parent().statusBar().showMessage(f"다운로드 완료: {len(res.get('saved',[]))}개", 3000)
+            self.window().statusBar().showMessage(f"다운로드 완료: {len(res.get('saved',[]))}개", 3000)
         else:
-            self.parent().statusBar().showMessage("다운로드 실패: "+res.get("error",""), 5000)
+            self.window().statusBar().showMessage("다운로드 실패: "+res.get("error",""), 5000)
+
+# ===== 간단 스택 위젯(토글 전환용) =====
+class QStackedWidgetSafe(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._lay = QVBoxLayout(self); self._lay.setContentsMargins(0,0,0,0)
+        self._stack = []; self._idx = 0
+    def addWidget(self, w: QWidget):
+        if self._stack:
+            w.setVisible(False)
+        self._stack.append(w); self._lay.addWidget(w)
+    def setCurrentIndex(self, i: int):
+        if i<0 or i>=len(self._stack): return
+        self._stack[self._idx].setVisible(False)
+        self._idx = i
+        self._stack[self._idx].setVisible(True)
+    def currentIndex(self): return self._idx
+    def widget(self, i:int): return self._stack[i]
 
 # ===== 메인 윈도우 =====
 class ClientWindow(QMainWindow):
@@ -476,14 +470,13 @@ class ClientWindow(QMainWindow):
         # 상단 바 + 컨트롤
         self.topbar = TopStatusBar(); self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
         self.btn_full = QPushButton("전체크기"); self.btn_full.clicked.connect(self.on_fullscreen)
-        self.btn_keep = QPushButton("원격해상도유지"); self.btn_keep.setCheckable(True); self.btn_keep.setChecked(True)
         self.btn_transfer = QPushButton("파일 전달"); self.btn_transfer.setCheckable(True); self.btn_transfer.clicked.connect(self.toggle_transfer_page)
 
         self.ed_ip = QLineEdit(self.server_ip); self.ed_ip.setFixedWidth(160)
         self.btn_re = QPushButton("재연결"); self.btn_re.clicked.connect(self.on_reconnect)
 
         ctrl = QHBoxLayout(); ctrl.setContentsMargins(8,4,8,4); ctrl.setSpacing(8)
-        ctrl.addWidget(self.btn_full); ctrl.addWidget(self.btn_keep); ctrl.addWidget(self.btn_transfer)
+        ctrl.addWidget(self.btn_full); ctrl.addWidget(self.btn_transfer)
         ctrl.addStretch(1)
         ctrl.addWidget(QLabel("서버 IP:")); ctrl.addWidget(self.ed_ip); ctrl.addWidget(self.btn_re)
 
@@ -511,33 +504,8 @@ class ClientWindow(QMainWindow):
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
 
         self.view.setFocusPolicy(Qt.StrongFocus)
-        self.btn_keep.clicked.connect(self.on_keep_toggle)
 
-    # ----- 스택 위젯의 안전한 포커스 전환 -----
-class QStackedWidgetSafe(QWidget):
-    def __init__(self):
-        super().__init__()
-        self._lay = QVBoxLayout(self); self._lay.setContentsMargins(0,0,0,0)
-        self._stack = []
-        self._idx = 0
-
-    def addWidget(self, w: QWidget):
-        if self._stack:
-            w.setVisible(False)
-        self._stack.append(w); self._lay.addWidget(w)
-
-    def setCurrentIndex(self, i: int):
-        if i<0 or i>=len(self._stack): return
-        self._stack[self._idx].setVisible(False)
-        self._idx = i
-        self._stack[self._idx].setVisible(True)
-
-    def currentIndex(self): return self._idx
-
-    # 편의
-    def widget(self, i:int): return self._stack[i]
-
-# ===== ClientWindow 계속 =====
+    # --- 토글: 파일 전달 페이지 ---
     def toggle_transfer_page(self, checked: bool):
         self.stack.setCurrentIndex(1 if checked else 0)
         if checked:
@@ -545,22 +513,22 @@ class QStackedWidgetSafe(QWidget):
         else:
             self.statusBar().clearMessage()
 
-    # 상태/프레임
+    # --- 상태/프레임 ---
     def on_status(self, fps:float, elapsed:int, connected:bool):
         self.topbar.update_fps(fps); self.topbar.update_time(elapsed if connected else 0)
         if not connected and self.stack.currentIndex()==0:
             self.view.setText("연결 끊김")
 
     def on_frame(self, qimg:QImage, w:int, h:int):
-        if self.stack.currentIndex()==0:  # 뷰어 페이지일 때만 갱신 표시
+        if self.stack.currentIndex()==0:
             self.view.set_remote_size(w,h)
             self.redraw(qimg)
 
     def redraw(self, qimg:QImage):
         pm = QPixmap.fromImage(qimg)
-        mode_keep = self.btn_keep.isChecked()
-        self.view.set_keep_aspect(mode_keep)
-        scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio if mode_keep else Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        # 항상 원격 해상도 비율 유지
+        self.view.set_keep_aspect(True)
+        scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.view.setPixmap(scaled)
 
     def resizeEvent(self, e):
@@ -568,10 +536,10 @@ class QStackedWidgetSafe(QWidget):
             self.redraw(self.view.pixmap().toImage())
         super().resizeEvent(e)
 
-    # 마우스/키 → 제어
+    # --- 마우스/키 → 제어 ---
     def on_mouse_local(self, ev:dict):
         if self.stack.currentIndex()!=0:
-            return  # 파일 전달 모드에서는 원격 마우스 주입 비활성화
+            return  # 파일 전달 모드에서는 원격 입력 차단
         cursor = QPoint(int(ev.get("x",0)), int(ev.get("y",0)))
         rx, ry = self.view.map_to_remote(cursor)
         t = ev.get("t")
@@ -586,12 +554,10 @@ class QStackedWidgetSafe(QWidget):
             self.cc.send_json({"t":"mouse_wheel","delta": int(ev.get("delta",0))})
 
     def keyPressEvent(self, e):
-        # 파일 전달 페이지일 때는 본문으로 넘겨서 Ctrl+C/V 등이 리스트에 들어가도록 함
         if self.stack.currentIndex()==0:
             if e.isAutoRepeat(): return
             vk = qt_to_vk(e)
-            if vk:
-                self.cc.send_key(vk, True)
+            if vk: self.cc.send_key(vk, True)
         else:
             super().keyPressEvent(e)
 
@@ -599,16 +565,11 @@ class QStackedWidgetSafe(QWidget):
         if self.stack.currentIndex()==0:
             if e.isAutoRepeat(): return
             vk = qt_to_vk(e)
-            if vk:
-                self.cc.send_key(vk, False)
+            if vk: self.cc.send_key(vk, False)
         else:
             super().keyReleaseEvent(e)
 
-    # 기타
-    def on_keep_toggle(self, checked:bool):
-        if self.stack.currentIndex()==0 and self.view.pixmap():
-            self.redraw(self.view.pixmap().toImage())
-
+    # --- 기타 ---
     def on_fullscreen(self):
         if self.isFullScreen(): self.showNormal()
         else: self.showFullScreen()
@@ -619,18 +580,22 @@ class QStackedWidgetSafe(QWidget):
             QMessageBox.warning(self,"알림","IP를 입력하세요."); return
         self.server_ip = ip
         self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
-        try: self.vc.stop(); self.vc.wait(1000)
-        except Exception: pass
+        try:
+            self.vc.stop(); self.vc.wait(1000)
+        except Exception:
+            pass
         self.vc = VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status); self.vc.sig_frame.connect(self.on_frame); self.vc.start()
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
+        # 파일 클라이언트 갱신
         self.fc = FileClient(self.server_ip, FILE_PORT)
-        # 파일 전달 페이지의 서버 호스트는 self.fc 내부 사용(새 인스턴스 적용)
         self.page_transfer.fc = self.fc
         self.page_transfer.refresh_server(None)
 
     def closeEvent(self, e):
-        try: self.vc.stop(); self.vc.wait(1000)
-        except Exception: pass
+        try:
+            self.vc.stop(); self.vc.wait(1000)
+        except Exception:
+            pass
         super().closeEvent(e)
 
 def main():
