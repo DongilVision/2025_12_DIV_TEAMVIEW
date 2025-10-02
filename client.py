@@ -67,24 +67,28 @@ class RemoteClient(QThread):
                         img_data += chunk
                     
                     if len(img_data) == msg_len:
-                        # 이미지 디코드
-                        img = Image.open(io.BytesIO(img_data))
-                        
-                        # QImage로 변환
-                        img_rgb = img.convert('RGB')
-                        data = img_rgb.tobytes('raw', 'RGB')
-                        qimg = QImage(data, img_rgb.width, img_rgb.height, QImage.Format_RGB888)
-                        
-                        self.screen_received.emit(qimg, width, height)
-                        
-                        # FPS 계산
-                        self.frame_count += 1
-                        current_time = time.time()
-                        if current_time - self.fps_timer >= 1.0:
-                            self.fps = self.frame_count
-                            self.frame_count = 0
-                            self.fps_timer = current_time
-                            self.stats_updated.emit(self.fps)
+                        try:
+                            # 이미지 디코드
+                            img = Image.open(io.BytesIO(img_data))
+                            
+                            # QImage로 변환
+                            img_rgb = img.convert('RGB')
+                            data = img_rgb.tobytes('raw', 'RGB')
+                            qimg = QImage(data, img_rgb.width, img_rgb.height, QImage.Format_RGB888)
+                            
+                            self.screen_received.emit(qimg, width, height)
+                            
+                            # FPS 계산
+                            self.frame_count += 1
+                            current_time = time.time()
+                            if current_time - self.fps_timer >= 1.0:
+                                self.fps = self.frame_count
+                                self.frame_count = 0
+                                self.fps_timer = current_time
+                                self.stats_updated.emit(self.fps)
+                        except Exception as img_error:
+                            print(f"이미지 처리 오류: {img_error}")
+                            continue
                             
         except Exception as e:
             print(f"수신 오류: {e}")
@@ -368,38 +372,42 @@ class RemoteDesktopViewer(QWidget):
     def eventFilter(self, source, event):
         """이벤트 필터 (마우스/키보드 이벤트 처리)"""
         if source == self.screen_label and self.connected:
-            # 마우스 좌표 계산
-            if self.scale_mode == "fit" and self.screen_label.pixmap():
-                scale_x = self.screen_width / self.screen_label.pixmap().width()
-                scale_y = self.screen_height / self.screen_label.pixmap().height()
-            else:
-                scale_x = 1.0
-                scale_y = 1.0
-            
-            if event.type() == QEvent.MouseMove:
-                x = event.position().x() * scale_x
-                y = event.position().y() * scale_y
-                self.client.send_mouse_move(x, y)
+            try:
+                # 마우스 좌표 계산
+                if self.scale_mode == "fit" and self.screen_label.pixmap() and not self.screen_label.pixmap().isNull():
+                    pixmap = self.screen_label.pixmap()
+                    scale_x = self.screen_width / pixmap.width()
+                    scale_y = self.screen_height / pixmap.height()
+                else:
+                    scale_x = 1.0
+                    scale_y = 1.0
                 
-            elif event.type() == QEvent.MouseButtonPress:
-                x = event.position().x() * scale_x
-                y = event.position().y() * scale_y
-                button = 1 if event.button() == Qt.LeftButton else 2 if event.button() == Qt.RightButton else 3
-                self.client.send_mouse_click(x, y, button, True)
-                
-            elif event.type() == QEvent.MouseButtonRelease:
-                x = event.position().x() * scale_x
-                y = event.position().y() * scale_y
-                button = 1 if event.button() == Qt.LeftButton else 2 if event.button() == Qt.RightButton else 3
-                self.client.send_mouse_click(x, y, button, False)
-                
-            elif event.type() == QEvent.Wheel:
-                x = event.position().x() * scale_x
-                y = event.position().y() * scale_y
-                delta = event.angleDelta()
-                dx = delta.x() / 120.0
-                dy = delta.y() / 120.0
-                self.client.send_mouse_scroll(x, y, dx, dy)
+                if event.type() == QEvent.MouseMove:
+                    x = event.position().x() * scale_x
+                    y = event.position().y() * scale_y
+                    self.client.send_mouse_move(x, y)
+                    
+                elif event.type() == QEvent.MouseButtonPress:
+                    x = event.position().x() * scale_x
+                    y = event.position().y() * scale_y
+                    button = 1 if event.button() == Qt.LeftButton else 2 if event.button() == Qt.RightButton else 3
+                    self.client.send_mouse_click(x, y, button, True)
+                    
+                elif event.type() == QEvent.MouseButtonRelease:
+                    x = event.position().x() * scale_x
+                    y = event.position().y() * scale_y
+                    button = 1 if event.button() == Qt.LeftButton else 2 if event.button() == Qt.RightButton else 3
+                    self.client.send_mouse_click(x, y, button, False)
+                    
+                elif event.type() == QEvent.Wheel:
+                    x = event.position().x() * scale_x
+                    y = event.position().y() * scale_y
+                    delta = event.angleDelta()
+                    dx = delta.x() / 120.0
+                    dy = delta.y() / 120.0
+                    self.client.send_mouse_scroll(x, y, dx, dy)
+            except Exception as e:
+                print(f"마우스 이벤트 처리 오류: {e}")
         
         return super().eventFilter(source, event)
     

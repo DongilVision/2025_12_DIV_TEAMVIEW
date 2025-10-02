@@ -63,6 +63,10 @@ class RemoteServer(QThread):
     
     def handle_client(self, client_socket, addr):
         print(f"클라이언트 연결됨: {addr}")
+        
+        # 클라이언트가 준비될 때까지 잠시 대기
+        time.sleep(0.5)
+        
         screen_thread = threading.Thread(target=self.send_screen, args=(client_socket,))
         screen_thread.daemon = True
         screen_thread.start()
@@ -84,31 +88,35 @@ class RemoteServer(QThread):
                             break
                         data += chunk
                     
-                    if msg_type == 1:  # Mouse move
-                        x, y = struct.unpack('!ff', data)
-                        self.mouse.position = (x, y)
-                    elif msg_type == 2:  # Mouse click
-                        x, y, button, pressed = struct.unpack('!ff?B', data[:9])
-                        self.mouse.position = (x, y)
-                        btn = Button.left if button == 1 else Button.right if button == 2 else Button.middle
-                        if pressed:
-                            self.mouse.press(btn)
-                        else:
-                            self.mouse.release(btn)
-                    elif msg_type == 3:  # Mouse scroll
-                        x, y, dx, dy = struct.unpack('!ffff', data)
-                        self.mouse.position = (x, y)
-                        self.mouse.scroll(dx, dy)
-                    elif msg_type == 4:  # Keyboard
-                        key_data = json.loads(data.decode())
-                        self.handle_keyboard(key_data)
-                    elif msg_type == 5:  # Clipboard text
-                        text = data.decode('utf-8')
-                        pyperclip.copy(text)
-                    elif msg_type == 6:  # File transfer
-                        self.handle_file_transfer(data, client_socket)
-                    elif msg_type == 7:  # Request clipboard
-                        self.send_clipboard(client_socket)
+                    try:
+                        if msg_type == 1:  # Mouse move
+                            x, y = struct.unpack('!ff', data)
+                            self.mouse.position = (x, y)
+                        elif msg_type == 2:  # Mouse click
+                            x, y, button, pressed = struct.unpack('!ff?B', data[:9])
+                            self.mouse.position = (x, y)
+                            btn = Button.left if button == 1 else Button.right if button == 2 else Button.middle
+                            if pressed:
+                                self.mouse.press(btn)
+                            else:
+                                self.mouse.release(btn)
+                        elif msg_type == 3:  # Mouse scroll
+                            x, y, dx, dy = struct.unpack('!ffff', data)
+                            self.mouse.position = (x, y)
+                            self.mouse.scroll(dx, dy)
+                        elif msg_type == 4:  # Keyboard
+                            key_data = json.loads(data.decode())
+                            self.handle_keyboard(key_data)
+                        elif msg_type == 5:  # Clipboard text
+                            text = data.decode('utf-8')
+                            pyperclip.copy(text)
+                        elif msg_type == 6:  # File transfer
+                            self.handle_file_transfer(data, client_socket)
+                        elif msg_type == 7:  # Request clipboard
+                            self.send_clipboard(client_socket)
+                    except Exception as cmd_error:
+                        print(f"명령 처리 오류: {cmd_error}")
+                        continue
                         
         except Exception as e:
             print(f"클라이언트 처리 오류: {e}")
@@ -124,23 +132,28 @@ class RemoteServer(QThread):
         """화면 데이터를 지속적으로 전송"""
         try:
             while self.running:
-                monitor = self.screen_grabber.monitors[0]
-                screenshot = self.screen_grabber.grab(monitor)
-                
-                # PIL Image로 변환
-                img = Image.frombytes('RGB', (screenshot.width, screenshot.height), screenshot.rgb)
-                
-                # JPEG로 압축
-                img_byte_arr = io.BytesIO()
-                img.save(img_byte_arr, format='JPEG', quality=70)
-                img_data = img_byte_arr.getvalue()
-                
-                # 화면 크기 정보와 함께 전송
-                header = struct.pack('!IIII', 0, len(img_data), screenshot.width, screenshot.height)
-                client_socket.send(header + img_data)
-                
-                time.sleep(0.033)  # ~30 FPS
-                
+                try:
+                    monitor = self.screen_grabber.monitors[0]
+                    screenshot = self.screen_grabber.grab(monitor)
+                    
+                    # PIL Image로 변환
+                    img = Image.frombytes('RGB', (screenshot.width, screenshot.height), screenshot.rgb)
+                    
+                    # JPEG로 압축
+                    img_byte_arr = io.BytesIO()
+                    img.save(img_byte_arr, format='JPEG', quality=70)
+                    img_data = img_byte_arr.getvalue()
+                    
+                    # 화면 크기 정보와 함께 전송
+                    header = struct.pack('!IIII', 0, len(img_data), screenshot.width, screenshot.height)
+                    client_socket.send(header + img_data)
+                    
+                    time.sleep(0.033)  # ~30 FPS
+                except Exception as screen_error:
+                    print(f"화면 캡처 오류: {screen_error}")
+                    time.sleep(0.1)  # 오류 시 잠시 대기
+                    continue
+                    
         except Exception as e:
             print(f"화면 전송 오류: {e}")
     
