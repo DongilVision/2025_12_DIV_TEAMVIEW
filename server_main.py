@@ -4,28 +4,18 @@ import numpy as np
 import cv2
 from mss import mss
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QStandardPaths, QUrl, QMimeData
 from PySide6.QtGui import QAction, QIcon, QGuiApplication
 from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QWidget, QVBoxLayout, QSystemTrayIcon, QMenu
 
-# --- COM/가상파일용 ---
-import struct as pystruct
-import pythoncom
-import win32clipboard
-import win32con
-from win32com.server.policy import DesignatedWrapPolicy
+from common import DEFAULT_HOST, VIDEO_PORT, CONTROL_PORT, FILE_PORT, FRAME_FPS, JPEG_QUALITY, get_local_ip
 
-from common import (
-    DEFAULT_HOST, VIDEO_PORT, CONTROL_PORT, FILE_PORT,
-    FRAME_FPS, JPEG_QUALITY, get_local_ip
-)
-
-# ============ Windows 입력 주입 ============
+# ====== Windows 입력 주입 ======
 user32 = ctypes.windll.user32
 SetCursorPos   = user32.SetCursorPos
 mouse_event    = user32.mouse_event
 keybd_event    = user32.keybd_event
-_CLIPBOARD_OBJ_HOLD = {"obj": None, "ts": 0}
+
 MOUSEEVENTF_LEFTDOWN   = 0x0002
 MOUSEEVENTF_LEFTUP     = 0x0004
 MOUSEEVENTF_RIGHTDOWN  = 0x0008
@@ -53,7 +43,42 @@ def recv_exact(sock: socket.socket, n: int) -> bytes | None:
         buf += chunk
     return bytes(buf)
 
-# ============ 영상 서버 ============
+# ====== 현재 활성 탐색기 폴더 경로 조회 ======
+def get_active_explorer_folder() -> str | None:
+    """
+    현재 포커스가 있는 Windows 탐색기(Explorer) 창의 폴더 경로를 반환.
+    실패 시 None. (pywin32 필요)
+    """
+    try:
+        import win32com.client
+    except Exception:
+        return None
+    try:
+        hwnd_fore = user32.GetForegroundWindow()
+        shell = win32com.client.Dispatch("Shell.Application")
+        for w in shell.Windows():
+            try:
+                if int(w.HWND) == hwnd_fore:
+                    # 폴더 창인지 확인 (탐색기 외 IE/Edge 등도 열릴 수 있음)
+                    doc = getattr(w, "Document", None)
+                    if not doc:
+                        continue
+                    folder = getattr(doc, "Folder", None)
+                    if not folder:
+                        continue
+                    self_obj = getattr(folder, "Self", None)
+                    if not self_obj:
+                        continue
+                    path = getattr(self_obj, "Path", None)
+                    if path and os.path.isdir(path):
+                        return path
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+# ====== 영상 서버 ======
 class VideoServer(QThread):
     sig_conn_changed = Signal(int)
     sig_res_changed  = Signal(int, int)
@@ -132,93 +157,14 @@ class VideoServer(QThread):
 
     def stop(self): self._stop.set()
 
-# ============ 가상 파일 COM 구현 ============
-CFSTR_FILEDESCRIPTORW = "FileGroupDescriptorW"
-CFSTR_FILECONTENTS     = "FileContents"
-MAX_PATH = 260
-FD_FILESIZE   = 0x00004000
-FD_WRITESTIME = 0x00000020
-
-def _build_filedescriptorw(filename:str, size:int):
-    name_utf16 = filename.encode("utf-16le")
-    name_utf16 = (name_utf16 + b"\x00\x00")[:MAX_PATH*2]
-    name_utf16 = name_utf16 + b"\x00\x00"*(MAX_PATH - len(name_utf16)//2)
-    hdr  = pystruct.pack("<I", FD_FILESIZE | FD_WRITESTIME)
-    hdr += b"\x00"*16  # clsid
-    hdr += b"\x00"*8   # sizel
-    hdr += b"\x00"*8   # pointl
-    hdr += pystruct.pack("<I", 0)        # attrs
-    hdr += pystruct.pack("<II", 0, 0)    # ctime
-    hdr += pystruct.pack("<II", 0, 0)    # atime
-    hdr += pystruct.pack("<II", 0, 0)    # mtime
-    hdr += pystruct.pack("<I", 0)        # high
-    hdr += pystruct.pack("<I", size)     # low
-    hdr += name_utf16
-    return hdr
-
-class _MemIStream:
-    _com_interfaces_ = [pythoncom.IID_IStream]
-    def __init__(self, data: bytes):
-        self._data = data; self._pos = 0
-    def Read(self, cb):
-        if self._pos >= len(self._data): return b""
-        chunk = self._data[self._pos:self._pos+cb]
-        self._pos += len(chunk); return bytes(chunk)
-    def Seek(self, dlibMove, dwOrigin):
-        if dwOrigin == 0: self._pos = dlibMove
-        elif dwOrigin == 1: self._pos += dlibMove
-        elif dwOrigin == 2: self._pos = len(self._data)+dlibMove
-        return self._pos
-    def Stat(self, flags): return (None,)
-
-class VirtualFileDataObject(DesignatedWrapPolicy):
-    _com_interfaces_ = [pythoncom.IID_IDataObject]
-    _public_methods_ = ['GetData','GetDataHere','QueryGetData','GetCanonicalFormatEtc',
-                        'SetData','EnumFormatEtc','DAdvise','DUnadvise','EnumDAdvise']
-    def __init__(self, files: list[dict]):
-        self._wrap_(self)
-        self.files = files
-        self.cf_filedesc = win32clipboard.RegisterClipboardFormat(CFSTR_FILEDESCRIPTORW)
-        self.cf_filecont = win32clipboard.RegisterClipboardFormat(CFSTR_FILECONTENTS)
-    def GetData(self, formatetc):
-        cfFormat, tymed, lindex, *_ = formatetc
-        if cfFormat == self.cf_filedesc:
-            payload = pystruct.pack("<I", len(self.files))
-            for f in self.files:
-                payload += _build_filedescriptorw(f["name"], len(f["data"]))
-            st = pythoncom.CreateStreamOnHGlobal()
-            st.Write(payload); st.Seek(0,0)
-            return (pythoncom.TYMED_ISTREAM, st)
-        if cfFormat == self.cf_filecont:
-            idx = int(lindex) if lindex is not None else 0
-            if 0 <= idx < len(self.files):
-                return (pythoncom.TYMED_ISTREAM, _MemIStream(self.files[idx]["data"]))
-        raise pythoncom.com_error(hresult=win32con.DV_E_FORMATETC, desc="Unsupported", scode=0, argerr=0, helpfile=None)
-    def QueryGetData(self, formatetc): return win32con.S_OK
-    def GetDataHere(self, *a, **k): raise pythoncom.com_error(win32con.DV_E_TYMED, None, None, None)
-    def GetCanonicalFormatEtc(self, *a, **k): return (None, win32con.DATA_S_SAMEFORMATETC)
-    def SetData(self, *a, **k): return win32con.S_OK
-    def EnumFormatEtc(self, *a, **k): raise pythoncom.com_error(win32con.E_NOTIMPL, None, None, None)
-    def DAdvise(self, *a, **k): return win32con.OLE_E_ADVISENOTSUPPORTED
-    def DUnadvise(self, *a, **k): return win32con.OLE_E_ADVISENOTSUPPORTED
-    def EnumDAdvise(self, *a, **k): return win32con.OLE_E_ADVISENOTSUPPORTED
-
-def set_virtual_files_to_clipboard(files: list[dict]):
-    pythoncom.OleInitialize()
-    obj = VirtualFileDataObject(files)
-    pythoncom.OleSetClipboard(obj)
-    # ★ 붙여넣기 대상이 읽어갈 때까지 객체 보관 (예: 120초)
-    _CLIPBOARD_OBJ_HOLD["obj"] = obj
-    _CLIPBOARD_OBJ_HOLD["ts"]  = time.time()
-
-# ============ 제어 서버 ============
+# ====== 제어 서버 ======
 class ControlServer(QThread):
     sig_ctrl_conn = Signal(bool)
-    def __init__(self, host: str, port: int, mem_sessions: dict):
+
+    def __init__(self, host: str, port: int):
         super().__init__()
         self.host = host; self.port = port
         self._stop = threading.Event()
-        self.mem_sessions = mem_sessions
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -230,7 +176,8 @@ class ControlServer(QThread):
                     c,_ = srv.accept()
                 except socket.timeout:
                     continue
-                threading.Thread(target=self._handle_conn, args=(c,), daemon=True).start()
+                t = threading.Thread(target=self._handle_conn, args=(c,), daemon=True)
+                t.start()
                 self.sig_ctrl_conn.emit(True)
         finally:
             try: srv.close()
@@ -261,71 +208,80 @@ class ControlServer(QThread):
 
         # 마우스
         if t == "mouse_move":
-            SetCursorPos(int(m.get("x",0)), int(m.get("y",0))); return
+            x = int(m.get("x", 0)); y = int(m.get("y", 0))
+            SetCursorPos(x, y); return
         if t == "mouse_down":
             btn = m.get("btn","left")
-            if btn=="left":  mouse_event(MOUSEEVENTF_LEFTDOWN,0,0,0,0)
+            if btn=="left":  mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0)
             elif btn=="right": mouse_event(MOUSEEVENTF_RIGHTDOWN,0,0,0,0)
             elif btn=="middle":mouse_event(MOUSEEVENTF_MIDDLEDOWN,0,0,0,0)
             return
         if t == "mouse_up":
             btn = m.get("btn","left")
-            if btn=="left":  mouse_event(MOUSEEVENTF_LEFTUP,0,0,0,0)
+            if btn=="left":  mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0)
             elif btn=="right": mouse_event(MOUSEEVENTF_RIGHTUP,0,0,0,0)
             elif btn=="middle":mouse_event(MOUSEEVENTF_MIDDLEUP,0,0,0,0)
             return
         if t == "mouse_wheel":
-            mouse_event(MOUSEEVENTF_WHEEL,0,0,int(m.get("delta",0)),0); return
+            delta = int(m.get("delta", 0))
+            mouse_event(MOUSEEVENTF_WHEEL, 0,0,delta,0); return
 
-        # 키보드
+        # 키보드 (vk 우선)
         if t == "key":
-            vk = int(m.get("vk",0)); down = bool(m.get("down",True))
+            vk = int(m.get("vk", 0))
+            down = bool(m.get("down", True))
             if vk:
-                keybd_event(vk, 0, 0 if down else KEYEVENTF_KEYUP, 0); return
+                keybd_event(vk, 0, 0 if down else KEYEVENTF_KEYUP, 0)
+                return
             name = m.get("key","")
             if not name: return
             if name == " ": name = "SPACE"
             up = name.upper()
-            if len(up)==1 and ("A"<=up<="Z" or "0"<=up<="9"):
-                keybd_event(ord(up),0,0 if down else KEYEVENTF_KEYUP,0); return
-            vk2 = VK_FALLBACK.get(up,0)
-            if vk2: keybd_event(vk2,0,0 if down else KEYEVENTF_KEYUP,0)
+            if len(up) == 1 and ("A"<=up<="Z" or "0"<=up<="9"):
+                keybd_event(ord(up), 0, 0 if down else KEYEVENTF_KEYUP, 0); return
+            vk2 = VK_FALLBACK.get(up, 0)
+            if vk2:
+                keybd_event(vk2, 0, 0 if down else KEYEVENTF_KEYUP, 0)
             return
 
-        # 클라이언트→서버 붙여넣기: 메모리 업로드를 가상파일로 설정
-        if t == "set_virtual_clip":
-            sess = m.get("session","")
+        # 파일 붙여넣기 편의 (폴백 시 사용)
+        if t == "set_clip_files":
+            paths = m.get("paths", [])
             and_paste = bool(m.get("and_paste", False))
-            files = self.mem_sessions.pop(sess, None)
-            if files:
-                set_virtual_files_to_clipboard(files)
+            if paths:
+                mime = QMimeData()
+                urls = [QUrl.fromLocalFile(p) for p in paths]
+                mime.setUrls(urls)
+                QGuiApplication.clipboard().setMimeData(mime)
                 if and_paste:
-                    keybd_event(0x11,0,0,0)               # CTRL down
-                    keybd_event(0x56,0,0,0)               # 'V'
-                    keybd_event(0x56,0,KEYEVENTF_KEYUP,0)
-                    keybd_event(0x11,0,KEYEVENTF_KEYUP,0)
+                    keybd_event(0x11,0,0,0)         # CTRL down
+                    keybd_event(0x56,0,0,0)         # 'V' down
+                    keybd_event(0x56,0,KEYEVENTF_KEYUP,0)  # 'V' up
+                    keybd_event(0x11,0,KEYEVENTF_KEYUP,0)  # CTRL up
             return
 
-# ============ 파일 서버 ============
+# ====== 파일 서버 ======
 class FileServer(QThread):
     """
-    업로드(클→서, 메모리): {"cmd":"upload_mem","session":"<id>","files":[{"name":..., "size":...}, ...]} + body
-      -> self.mem_sessions[session] = [{"name","data(bytes)"}]
-    서버 클립보드 다운로드(서→클): {"cmd":"download_clip"} 요청 시
-      - 서버 클립보드가 CF_HDROP(경로)면 각 파일을 읽어 스트리밍 전송
-      응답 헤더: {"cmd":"download_clip","files":[{"name":..., "size":...}, ...]}
-      이후 파일 바디를 순차 전송
+    요청 종류:
+    - {"cmd":"active_folder"}  → 현재 활성 탐색기 폴더 경로 반환
+      응답: {"ok":true, "path":"C:\\..."} 또는 {"ok":false}
+
+    - {"cmd":"upload","files":[{name,size}...], "target_dir":"C:\\..."} + 본문
+      응답: {"ok":true, "saved_dir": "...", "saved_paths":[...]}
+      target_dir 없으면 Downloads/RemoteDrop으로 저장(폴백)
+
+    - {"cmd":"download_clip"}  (이전과 동일, 필요 시 사용)
     """
-    def __init__(self, host: str, port: int, mem_sessions: dict):
+    def __init__(self, host: str, port: int):
         super().__init__()
         self.host = host; self.port = port
         self._stop = threading.Event()
-        self.mem_sessions = mem_sessions
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.host, self.port)); srv.listen(2); srv.settimeout(0.5)
+        srv.bind((self.host, self.port)); srv.listen(3); srv.settimeout(0.5)
         try:
             while not self._stop.is_set():
                 try:
@@ -349,40 +305,54 @@ class FileServer(QThread):
             req = json.loads(jraw.decode("utf-8", errors="ignore"))
             cmd = req.get("cmd","")
 
-            if cmd == "upload_mem":
-                self._handle_upload_mem(sock, req)
-            elif cmd == "download_clip":
-                self._handle_download_clip(sock)
+            if cmd == "active_folder":
+                path = get_active_explorer_folder()
+                resp = {"ok": bool(path), "path": path or ""}
+                raw = json.dumps(resp).encode("utf-8")
+                sock.sendall(struct.pack(">I", len(raw)) + raw)
+                return
+
+            if cmd == "upload":
+                self._handle_upload(sock, req); return
+
+            if cmd == "download_clip":
+                self._handle_download_clip(sock); return
         except Exception:
             pass
         finally:
             try: sock.close()
             except: pass
 
-    def _handle_upload_mem(self, sock, req):
-        session = req.get("session","")
-        files_meta = req.get("files", [])
-        buf_list = []
-        for meta in files_meta:
+    def _handle_upload(self, sock, req):
+        files = req.get("files", [])
+        target_dir = req.get("target_dir") or ""
+        save_dir = None
+        if target_dir and os.path.isdir(target_dir):
+            save_dir = target_dir
+        else:
+            base_dir = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or os.path.expanduser("~/Downloads")
+            save_dir = os.path.join(base_dir, "RemoteDrop")
+        os.makedirs(save_dir, exist_ok=True)
+
+        saved_paths = []
+        for meta in files:
             name = os.path.basename(meta.get("name","file"))
             size = int(meta.get("size", 0))
-            remain = size; chunks = []
-            while remain > 0:
-                chunk = sock.recv(min(1024*256, remain))
-                if not chunk: raise ConnectionError("file stream interrupted")
-                chunks.append(chunk); remain -= len(chunk)
-            data = b"".join(chunks)
-            buf_list.append({"name": name, "data": data})
-        if session:
-            self.mem_sessions[session] = buf_list
-        ack = json.dumps({"ok": True}).encode("utf-8")
+            dst  = os.path.join(save_dir, name)
+            with open(dst, "wb") as f:
+                remain = size
+                while remain > 0:
+                    chunk = sock.recv(min(1024*256, remain))
+                    if not chunk: raise ConnectionError("file stream interrupted")
+                    f.write(chunk); remain -= len(chunk)
+            saved_paths.append(dst)
+
+        ack = json.dumps({"ok": True, "saved_dir": save_dir, "saved_paths": saved_paths}).encode("utf-8")
         sock.sendall(struct.pack(">I", len(ack)) + ack)
 
     def _handle_download_clip(self, sock):
-        # 서버 클립보드에서 파일 경로 읽기(CF_HDROP)
-        from PySide6.QtGui import QClipboard
         cb = QGuiApplication.clipboard()
-        md = cb.mimeData(mode=QClipboard.Clipboard)
+        md = cb.mimeData()
         urls = md.urls() if md else []
         paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
 
@@ -403,20 +373,18 @@ class FileServer(QThread):
                     if not buf: break
                     sock.sendall(buf)
 
-# ============ 서버 윈도우 ============
+# ====== 서버 윈도우 ======
 class ServerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("원격화면 서버")
-        self.setFixedSize(360, 200)
+        self.setFixedSize(380, 210)
         self.start_ts = time.time()
         self.ip = get_local_ip()
 
-        self.mem_sessions = {}
-
         self.video = VideoServer(DEFAULT_HOST, VIDEO_PORT)
-        self.ctrl  = ControlServer(DEFAULT_HOST, CONTROL_PORT, self.mem_sessions)
-        self.files = FileServer(DEFAULT_HOST, FILE_PORT, self.mem_sessions)
+        self.ctrl  = ControlServer(DEFAULT_HOST, CONTROL_PORT)
+        self.files = FileServer(DEFAULT_HOST, FILE_PORT)
         self.video.sig_conn_changed.connect(self.on_video_conn)
         self.video.sig_res_changed.connect(self.on_res)
         self.ctrl.sig_ctrl_conn.connect(self.on_ctrl_conn)
@@ -441,13 +409,6 @@ class ServerWindow(QMainWindow):
         self.tray.setIcon(QIcon.fromTheme("application-exit"))
         menu = QMenu(); act_quit = QAction("종료", self); act_quit.triggered.connect(self.close)
         menu.addAction(act_quit); self.tray.setContextMenu(menu); self.tray.show()
-        self._gc_timer = QTimer(self)
-        self._gc_timer.timeout.connect(self._gc_clip_obj)
-        self._gc_timer.start(5000)
-        
-    def _gc_clip_obj(self):
-        if _CLIPBOARD_OBJ_HOLD["obj"] and time.time() - _CLIPBOARD_OBJ_HOLD["ts"] > 120:
-            _CLIPBOARD_OBJ_HOLD["obj"] = None  # 참조 해제(가비지 컬렉션 허용)
 
     def on_video_conn(self, n:int): self._update_conn_label(n, None)
     def on_ctrl_conn(self, ok:bool): self._update_conn_label(None, ok)
@@ -455,10 +416,12 @@ class ServerWindow(QMainWindow):
 
     def _update_conn_label(self, vid_cnt, ctrl_ok):
         if vid_cnt is None:
-            parts = self.lbl_conns.text().split("|"); left = parts[0].strip()
+            parts = self.lbl_conns.text().split("|")
+            left = parts[0].strip()
             self.lbl_conns.setText(f"{left} | 제어 연결: {'OK' if ctrl_ok else '-'}")
         elif ctrl_ok is None:
-            parts = self.lbl_conns.text().split("|"); right = parts[1].strip() if len(parts)>1 else "제어 연결: -"
+            parts = self.lbl_conns.text().split("|")
+            right = parts[1].strip() if len(parts)>1 else "제어 연결: -"
             self.lbl_conns.setText(f"영상 연결 수: {vid_cnt} | {right}")
 
     def update_uptime(self):
