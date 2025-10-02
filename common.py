@@ -9,7 +9,6 @@ FRAME_FPS      = 12
 JPEG_QUALITY   = 80
 
 def get_local_ip() -> str:
-    """현재 머신의 로컬 IP를 반환."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))

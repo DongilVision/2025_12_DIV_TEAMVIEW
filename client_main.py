@@ -4,7 +4,7 @@ import numpy as np
 import cv2
 
 from PySide6.QtCore import Qt, QThread, Signal, QPoint
-from PySide6.QtGui import QImage, QPixmap, QGuiApplication
+from PySide6.QtGui import QImage, QPixmap, QGuiApplication, QShortcut, QKeySequence
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QLabel, QHBoxLayout, QVBoxLayout, QPushButton, QFrame, QLineEdit, QMessageBox
 
 from common import VIDEO_PORT, CONTROL_PORT, FILE_PORT
@@ -179,8 +179,6 @@ class FileClient:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5.0); s.connect((self.host, self.port)); s.settimeout(None)
         return s
-
-    # 서버 활성 폴더
     def get_server_active_folder(self):
         s = self._connect()
         try:
@@ -195,8 +193,6 @@ class FileClient:
             return bool(resp.get("ok")), resp.get("path","")
         finally:
             s.close()
-
-    # 서버 클립 메타(파일 존재 체크)
     def get_server_clip_meta(self):
         s = self._connect()
         try:
@@ -211,8 +207,6 @@ class FileClient:
             return bool(resp.get("ok", False)), resp.get("files", [])
         finally:
             s.close()
-
-    # 서버 클립보드 → 로컬 저장
     def download_from_server_clip(self, target_dir: str | None):
         def _writable_dir(d: str) -> bool:
             try:
@@ -222,73 +216,51 @@ class FileClient:
                 return True
             except Exception:
                 return False
-
-        # 1) 저장 경로 결정(쓰기 가능 검사), 아니면 폴백
         if target_dir and os.path.isdir(target_dir) and _writable_dir(target_dir):
             base_dir = target_dir
         else:
             base_default = os.path.join(os.path.expanduser("~"), "Downloads")
             base_dir = os.path.join(base_default, "RemoteFromServer")
             os.makedirs(base_dir, exist_ok=True)
-
-        # 2) 서버 접속 후 헤더 수신
         s = self._connect()
         try:
             req = json.dumps({"cmd":"download_clip"}).encode("utf-8")
             s.sendall(struct.pack(">I", len(req)) + req)
-
             jlen_b = recv_exact(s, 4)
             if not jlen_b: return False, "서버 응답 없음", []
             jlen = struct.unpack(">I", jlen_b)[0]
             head = json.loads(recv_exact(s, jlen).decode("utf-8","ignore"))
             files = head.get("files", [])
-            if not files:
-                return False, "서버 클립보드에 파일이 없습니다.", []
-
-            saved_paths = []
-            # 3) 각 파일 본문 수신/저장 (개별 실패 시 폴백 디렉터리로 재시도)
+            if not files: return False, "서버 클립보드에 파일이 없습니다.", []
+            saved_paths=[]
             for m in files:
                 name = os.path.basename(m.get("name","file"))
                 size = int(m.get("size",0))
                 remain = size
-
-                # 기본 저장 경로
-                dst_dir = base_dir
-                dst = os.path.join(dst_dir, name)
-
-                # 열기 실패 시 폴백 디렉터리 강제
+                dst = os.path.join(base_dir, name)
                 try:
                     f = open(dst, "wb")
                 except Exception:
-                    fb_root = os.path.join(os.path.expanduser("~"), "Downloads", "RemoteFromServer")
-                    os.makedirs(fb_root, exist_ok=True)
-                    dst_dir = fb_root
-                    dst = os.path.join(dst_dir, name)
+                    fb = os.path.join(os.path.expanduser("~"), "Downloads", "RemoteFromServer")
+                    os.makedirs(fb, exist_ok=True)
+                    dst = os.path.join(fb, name)
                     f = open(dst, "wb")
-
-                # 스트림은 끝까지 소비(프로토콜 정합성)
                 try:
                     with f:
                         while remain > 0:
                             chunk = s.recv(min(1024*256, remain))
                             if not chunk:
                                 raise ConnectionError("file stream interrupted")
-                            f.write(chunk)
-                            remain -= len(chunk)
+                            f.write(chunk); remain -= len(chunk)
                     saved_paths.append(dst)
                 except Exception:
                     while remain > 0:
                         chunk = s.recv(min(1024*256, remain))
-                        if not chunk:
-                            break
+                        if not chunk: break
                         remain -= len(chunk)
-                    # 이 파일은 스킵
-
-            return (len(saved_paths) > 0), (base_dir if saved_paths else ""), saved_paths
+            return (len(saved_paths)>0), (base_dir if saved_paths else ""), saved_paths
         finally:
             s.close()
-
-    # 로컬 클립보드 → 서버 저장
     def upload_local_clip_to_server(self, target_dir: str | None):
         cb = QGuiApplication.clipboard(); md = cb.mimeData()
         urls = md.urls() if md else []
@@ -319,7 +291,7 @@ class FileClient:
         finally:
             s.close()
 
-# ---- 로컬(클라이언트) 활성 탐색기 폴더 조회 ----
+# ---- 로컬 활성 탐색기 폴더 ----
 def get_local_active_explorer_folder() -> str | None:
     try:
         import win32com.client, win32gui
@@ -340,7 +312,7 @@ def get_local_active_explorer_folder() -> str | None:
         return None
     return None
 
-# ---- UI 컴포넌트 ----
+# ---- UI ----
 class TopStatusBar(QFrame):
     def __init__(self):
         super().__init__()
@@ -384,54 +356,48 @@ class ViewerLabel(QLabel):
         self.sig_mouse.emit({"t":"up","btn":btn,"x":e.position().x(),"y":e.position().y()})
     def wheelEvent(self, e): self.sig_mouse.emit({"t":"wheel","delta": e.angleDelta().y()})
 
-# ---- 메인 윈도우 ----
 class ClientWindow(QMainWindow):
     def __init__(self, server_ip: str):
         super().__init__()
         self.setWindowTitle("원격 뷰어 클라이언트"); self.resize(1100, 720)
         self.server_ip = server_ip
-
         self.topbar = TopStatusBar(); self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
         self.btn_full = QPushButton("전체크기"); self.btn_full.clicked.connect(self.on_fullscreen)
         self.btn_keep = QPushButton("원격해상도유지"); self.btn_keep.setCheckable(True); self.btn_keep.setChecked(True)
         self.ed_ip = QLineEdit(self.server_ip); self.ed_ip.setFixedWidth(160)
         self.btn_re = QPushButton("재연결"); self.btn_re.clicked.connect(self.on_reconnect)
-
-        self.view = ViewerLabel("원격 화면 수신 대기")
-        self.view.setAlignment(Qt.AlignCenter)
-        self.view.setStyleSheet("background:#202020; color:#DDDDDD;")
-        self.view.sig_mouse.connect(self.on_mouse_local)
-
+        self.view = ViewerLabel("원격 화면 수신 대기"); self.view.setAlignment(Qt.AlignCenter)
+        self.view.setStyleSheet("background:#202020; color:#DDDDDD;"); self.view.sig_mouse.connect(self.on_mouse_local)
         ctrl = QHBoxLayout(); ctrl.setContentsMargins(8,4,8,4); ctrl.setSpacing(8)
         ctrl.addWidget(self.btn_full); ctrl.addWidget(self.btn_keep); ctrl.addStretch(1)
         ctrl.addWidget(QLabel("서버 IP:")); ctrl.addWidget(self.ed_ip); ctrl.addWidget(self.btn_re)
-
-        v = QVBoxLayout(); v.addWidget(self.topbar); v.addLayout(ctrl); v.addWidget(self.view, 1)
+        v = QVBoxLayout(); v.addWidget(self.topbar); v.addLayout(ctrl); v.addWidget(self.view,1)
         wrap = QWidget(); wrap.setLayout(v); self.setCentralWidget(wrap)
 
         self.vc = VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status); self.vc.sig_frame.connect(self.on_frame); self.vc.start()
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
         self.fc = FileClient(self.server_ip, FILE_PORT)
-
         self.view.setFocusPolicy(Qt.StrongFocus)
         self.btn_keep.clicked.connect(self.on_keep_toggle)
+
+        # ---- 핵심 변경: 전역 QShortcut로 Ctrl+V를 확실히 캡처 ----
+        self.sc_paste_auto = QShortcut(QKeySequence("Ctrl+V"), self)
+        self.sc_paste_auto.activated.connect(lambda: self.handle_paste(mode="auto"))
+        self.sc_paste_dl = QShortcut(QKeySequence("Ctrl+Shift+V"), self)
+        self.sc_paste_dl.activated.connect(lambda: self.handle_paste(mode="dl"))
+        self.sc_paste_ul = QShortcut(QKeySequence("Ctrl+Alt+V"), self)
+        self.sc_paste_ul.activated.connect(lambda: self.handle_paste(mode="ul"))
 
     # 상태/프레임
     def on_status(self, fps:float, elapsed:int, connected:bool):
         self.topbar.update_fps(fps); self.topbar.update_time(elapsed if connected else 0)
         if not connected: self.view.setText("연결 끊김")
-
     def on_frame(self, qimg:QImage, w:int, h:int):
-        self.view.set_remote_size(w,h)
-        self.redraw(qimg)
-
+        self.view.set_remote_size(w,h); self.redraw(qimg)
     def redraw(self, qimg:QImage):
         pm = QPixmap.fromImage(qimg)
-        mode_keep = self.btn_keep.isChecked()
-        self.view.set_keep_aspect(mode_keep)
-        scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio if mode_keep else Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        self.view.setPixmap(scaled)
-
+        mode = self.btn_keep.isChecked()
+        self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio if mode else Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
     def resizeEvent(self, e):
         if self.view.pixmap() and not self.view.pixmap().isNull():
             self.redraw(self.view.pixmap().toImage())
@@ -451,65 +417,56 @@ class ClientWindow(QMainWindow):
         elif t == "wheel":
             self.cc.send_json({"t":"mouse_wheel","delta":int(ev.get("delta",0))})
 
-    # ---- 키 처리: 양방향 파일 붙여넣기 ----
-    def keyPressEvent(self, e):
-        if e.isAutoRepeat(): return
-
-        is_ctrl_v  = (e.modifiers() & Qt.ControlModifier) and e.key() == Qt.Key_V
-        force_dl   = (e.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier)) == (Qt.ControlModifier | Qt.ShiftModifier) and e.key() == Qt.Key_V  # Ctrl+Shift+V (서버→클라이언트 강제)
-        force_ul   = (e.modifiers() & (Qt.ControlModifier | Qt.AltModifier))   == (Qt.ControlModifier | Qt.AltModifier)   and e.key() == Qt.Key_V  # Ctrl+Alt+V (클라이언트→서버 강제)
-
-        if is_ctrl_v:
-            if force_dl:
-                # 서버 → 클라이언트 강제
+    # ---- 전역 붙여넣기 처리 ----
+    def handle_paste(self, mode: str):
+        # mode: "auto" | "dl"(서버->클라 강제) | "ul"(클라->서버 강제)
+        try:
+            if mode == "dl":
                 local_dir = get_local_active_explorer_folder()
                 ok_down, saved_dir, saved_paths = self.fc.download_from_server_clip(local_dir or None)
                 if ok_down and saved_paths:
-                    self.statusBar().showMessage(f"서버 → 로컬 저장 완료: {saved_dir} ({len(saved_paths)}개)", 5000)
+                    self.statusBar().showMessage(f"서버 → 로컬 저장: {saved_dir} ({len(saved_paths)}개)", 5000)
                     return
-            elif force_ul:
-                # 클라이언트 → 서버 강제
+            elif mode == "ul":
                 ok_path, srv_dir = self.fc.get_server_active_folder()
                 ok_up, saved_dir, saved_paths = self.fc.upload_local_clip_to_server(srv_dir if ok_path else None)
                 if ok_up and saved_paths:
                     self.cc.send_key(VK["F5"], True); self.cc.send_key(VK["F5"], False)
-                    self.statusBar().showMessage(f"서버에 저장됨: {saved_dir}", 4000)
+                    self.statusBar().showMessage(f"서버에 저장: {saved_dir}", 4000)
                     return
-            else:
-                # 1) 서버 클립에 파일이 있으면 서버 → 클라이언트 우선
+            else:  # auto
                 has_srv, files_meta = self.fc.get_server_clip_meta()
                 if has_srv and files_meta:
                     local_dir = get_local_active_explorer_folder()
                     ok_down, saved_dir, saved_paths = self.fc.download_from_server_clip(local_dir or None)
                     if ok_down and saved_paths:
-                        self.statusBar().showMessage(f"서버 → 로컬 저장 완료: {saved_dir} ({len(saved_paths)}개)", 5000)
+                        self.statusBar().showMessage(f"서버 → 로컬 저장: {saved_dir} ({len(saved_paths)}개)", 5000)
                         return
-                # 2) 서버에 없으면 로컬 클립보드 파일을 서버로 업로드
-                if self._local_clip_has_files():
+                # 서버에 없으면 로컬→서버 업로드
+                md = QGuiApplication.clipboard().mimeData()
+                if md and any(u.isLocalFile() for u in md.urls()):
                     ok_path, srv_dir = self.fc.get_server_active_folder()
                     ok_up, saved_dir, saved_paths = self.fc.upload_local_clip_to_server(srv_dir if ok_path else None)
                     if ok_up and saved_paths:
                         self.cc.send_key(VK["F5"], True); self.cc.send_key(VK["F5"], False)
-                        self.statusBar().showMessage(f"서버에 저장됨: {saved_dir}", 4000)
+                        self.statusBar().showMessage(f"서버에 저장: {saved_dir}", 4000)
                         return
-
-            # 3) 여기까지 못 옮겼다면 일반 Ctrl+V를 서버로 전달
+            # 여기까지 안되면 일반 Ctrl+V를 서버로 전달
             self.cc.send_key(VK["CTRL"], True); self.cc.send_key(ord('V'), True)
             self.cc.send_key(ord('V'), False);  self.cc.send_key(VK["CTRL"], False)
-            return
+        except Exception as ex:
+            self.statusBar().showMessage(f"붙여넣기 오류: {ex}", 5000)
 
-        # 일반 키 처리
+    # (키 이벤트는 예비 백업용으로 유지해도 무방)
+    def keyPressEvent(self, e):
+        # QShortcut가 우선 처리하므로 여기서는 일반 키만 보냅니다.
+        if e.isAutoRepeat(): return
         vk = qt_to_vk(e)
         if vk: self.cc.send_key(vk, True)
-
     def keyReleaseEvent(self, e):
         if e.isAutoRepeat(): return
         vk = qt_to_vk(e)
         if vk: self.cc.send_key(vk, False)
-
-    def _local_clip_has_files(self) -> bool:
-        md = QGuiApplication.clipboard().mimeData()
-        return bool(md and any(u.isLocalFile() for u in md.urls()))
 
     # 기타
     def on_keep_toggle(self, _):
