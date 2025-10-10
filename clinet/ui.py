@@ -1,11 +1,12 @@
 # client/ui.py
 import os
 from PySide6.QtCore import Qt, QPoint, Signal
-from PySide6.QtGui import QImage, QPixmap, QIcon
+from PySide6.QtGui import QImage, QPixmap, QIcon, QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QStyle, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
-    QHeaderView, QSplitter, QProgressBar, QMessageBox, QSizePolicy
+    QHeaderView, QSplitter, QProgressBar, QMessageBox, QSizePolicy,
+    QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox, QAbstractItemView, QMenu
 )
 from utils import qt_to_vk, human_size, fmt_mtime
 from net import VideoClient, ControlClient, FileClient
@@ -14,6 +15,88 @@ from net import VideoClient, ControlClient, FileClient
 
 from common import VIDEO_PORT, CONTROL_PORT, FILE_PORT  # 프로젝트 루트 공유 파일
 
+class IpEditDialog(QDialog):
+    def __init__(self, parent=None, *, title="IP 추가", ok_text="추가", alias="", ip=""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setFixedSize(300, 200)
+
+        lbl_alias = QLabel("별칭")
+        self.ed_alias = QLineEdit(); self.ed_alias.setPlaceholderText("예: test pc"); self.ed_alias.setText(alias)
+
+        lbl_ip = QLabel("IP 주소")
+        self.ed_ip = QLineEdit(); self.ed_ip.setPlaceholderText("예: 192.168.2.111"); self.ed_ip.setText(ip)
+
+        btns = QDialogButtonBox()
+        btn_ok = btns.addButton(ok_text, QDialogButtonBox.AcceptRole)
+        btn_cancel = btns.addButton("취소", QDialogButtonBox.RejectRole)
+
+        lay = QVBoxLayout(self); lay.setContentsMargins(14,14,14,14); lay.setSpacing(8)
+        lay.addWidget(lbl_alias); lay.addWidget(self.ed_alias)
+        lay.addWidget(lbl_ip); lay.addWidget(self.ed_ip)
+        lay.addWidget(btns)
+
+        btn_ok.clicked.connect(self._on_accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    def _on_accept(self):
+        alias = self.ed_alias.text().strip()
+        ip = self.ed_ip.text().strip()
+        if not alias or not ip:
+            QMessageBox.warning(self, "확인", "별칭과 IP를 모두 입력하세요.")
+            return
+        # IPv4 형식 간단 검증
+        import socket
+        try:
+            socket.inet_aton(ip)
+        except OSError:
+            QMessageBox.warning(self, "확인", "유효한 IPv4 주소가 아닙니다.")
+            return
+        self.alias = alias
+        self.ip = ip
+        self.accept()
+
+class AddIpDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("IP 추가")
+        self.setModal(True)
+        self.setFixedSize(300, 200)
+
+        lbl_alias = QLabel("별칭")
+        self.ed_alias = QLineEdit(); self.ed_alias.setPlaceholderText("예: test pc")
+        lbl_ip = QLabel("IP 주소")
+        self.ed_ip = QLineEdit(); self.ed_ip.setPlaceholderText("예: 192.168.2.111")
+
+        btns = QDialogButtonBox()
+        btn_add = btns.addButton("추가", QDialogButtonBox.AcceptRole)
+        btn_cancel = btns.addButton("취소", QDialogButtonBox.RejectRole)
+
+        lay = QVBoxLayout(self); lay.setContentsMargins(14,14,14,14); lay.setSpacing(8)
+        lay.addWidget(lbl_alias); lay.addWidget(self.ed_alias)
+        lay.addWidget(lbl_ip); lay.addWidget(self.ed_ip)
+        lay.addWidget(btns)
+
+        btn_add.clicked.connect(self._on_accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    def _on_accept(self):
+        alias = self.ed_alias.text().strip()
+        ip = self.ed_ip.text().strip()
+        if not alias or not ip:
+            QMessageBox.warning(self, "확인", "별칭과 IP를 모두 입력하세요.")
+            return
+        # 간단한 IP 형식 검증
+        import socket
+        try:
+            socket.inet_aton(ip)
+        except OSError:
+            QMessageBox.warning(self, "확인", "유효한 IPv4 주소가 아닙니다.")
+            return
+        self.alias = alias
+        self.ip = ip
+        self.accept()
 
 # ===================== 연결 다이얼로그 =====================
 class ConnectDialog(QDialog):
@@ -21,35 +104,210 @@ class ConnectDialog(QDialog):
         super().__init__(parent)
         self.setObjectName("ConnectDialog")
         self.setWindowTitle("원격 연결")
-        self.setFixedSize(220, 180)
 
-        lbl_title = QLabel("서버 IP")
-        ed = QLineEdit()
-        if default_ip: ed.setText(default_ip)
-        ed.setPlaceholderText("예: 192.168.1.100")
-        btn = QPushButton("연결")
-        self.lbl_err = QLabel(""); self.lbl_err.setObjectName("ConnectError")
+        # 리스트 UI가 들어가므로 조금 키웁니다.
+        self.setFixedSize(500, 400)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(14,14,14,14); lay.setSpacing(10)
-        lay.addWidget(lbl_title)
-        lay.addWidget(ed)
+        # --- 위젯들 ---
+        # 토글: 직접 입력
+        self.cb_manual = QCheckBox("직접 입력")
+        self.cb_manual.setChecked(True)  # 기본은 직접 입력
+
+        # 직접 입력란
+        self.ed_ip = QLineEdit()
+        if default_ip:
+            self.ed_ip.setText(default_ip)
+        self.ed_ip.setPlaceholderText("예: 192.168.2.130")
+
+        # 리스트/추가 버튼
+        self.list_ips = QListWidget()
+        self.list_ips.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        # ★ 컨텍스트 메뉴 활성화
+        self.list_ips.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_ips.customContextMenuRequested.connect(self._on_list_menu)
+
+        self.btn_add_ip = QPushButton("IP 추가")
+
+        # 하단 버튼/에러
+        self.btn_connect = QPushButton("연결")
+        self.lbl_err = QLabel("")
+        self.lbl_err.setObjectName("ConnectError")
+
+        # --- 레이아웃 ---
+        lay = QVBoxLayout(self); lay.setContentsMargins(14,14,14,14); lay.setSpacing(8)
+        lay.addWidget(self.cb_manual)
+        lay.addWidget(QLabel("서버 IP"))
+        lay.addWidget(self.ed_ip)
+
+        lay.addWidget(QLabel("IP 리스트"))
+        row = QHBoxLayout(); row.addWidget(self.list_ips, 1); row.addWidget(self.btn_add_ip, 0)
+        lay.addLayout(row)
+
         lay.addStretch(1)
-        lay.addWidget(btn)
+        lay.addWidget(self.btn_connect)
         lay.addWidget(self.lbl_err)
 
-        self.ed_ip = ed
-        btn.clicked.connect(self.try_connect)
-        ed.returnPressed.connect(self.try_connect)
+        # --- 시그널 ---
+        self.cb_manual.toggled.connect(self._update_mode)
+        self.btn_add_ip.clicked.connect(self._on_add_ip)
+        self.btn_connect.clicked.connect(self.try_connect)
+        self.ed_ip.returnPressed.connect(self.try_connect)
+        self.list_ips.itemDoubleClicked.connect(lambda *_: self.try_connect())
 
-    # CONTROL → VIDEO → FILE 순으로 빠르게 연결성 점검
+        # --- 데이터 로드 & 초기 모드 ---
+        self._ip_list_path = os.path.join(os.path.dirname(__file__), "ip_list.json")
+        self._load_ip_list()
+
+        # default_ip가 리스트에 있으면 리스트 모드로 전환
+        if default_ip and any(item.get("ip")==default_ip for item in self._ip_list):
+            self.cb_manual.setChecked(False)
+            # 해당 항목 선택
+            for i in range(self.list_ips.count()):
+                it = self.list_ips.item(i)
+                data = it.data(Qt.UserRole)
+                if data and data.get("ip")==default_ip:
+                    self.list_ips.setCurrentItem(it)
+                    break
+        self._update_mode()  # 위젯 활성화/비활성 적용
+
+    # --- IP 리스트 저장/로딩 ---
+    def _load_ip_list(self):
+        import json
+        self._ip_list = []
+        try:
+            if os.path.exists(self._ip_list_path):
+                with open(self._ip_list_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        # [{alias, ip}, ...] 기대
+                        self._ip_list = [x for x in data if isinstance(x, dict) and "ip" in x]
+        except Exception:
+            pass
+        self._refresh_list_widget()
+
+    def _save_ip_list(self):
+        import json, tempfile, shutil
+        os.makedirs(os.path.dirname(self._ip_list_path), exist_ok=True)
+        tmp = self._ip_list_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._ip_list, f, ensure_ascii=False, indent=2)
+        # 원자적 교체
+        shutil.move(tmp, self._ip_list_path)
+
+    def _refresh_list_widget(self):
+        self.list_ips.clear()
+        for item in self._ip_list:
+            alias = str(item.get("alias","")).strip() or "(무제)"
+            ip = item.get("ip","")
+            disp = f"{alias}({ip})"   # 예: test pc(192.168.2.111)
+            lw = QListWidgetItem(disp)
+            lw.setData(Qt.UserRole, {"alias": alias, "ip": ip})
+            self.list_ips.addItem(lw)
+
+    # --- 모드 토글 ---
+    def _update_mode(self):
+        manual = self.cb_manual.isChecked()
+        self.ed_ip.setEnabled(manual)
+        self.list_ips.setEnabled(not manual)
+        self.btn_add_ip.setEnabled(not manual)
+        self.lbl_err.setText("")
+
+    # --- IP 추가 ---
+    def _on_add_ip(self):
+        dlg = IpEditDialog(self, title="IP 추가", ok_text="추가")
+        if dlg.exec() == QDialog.Accepted:
+            # 중복 IP면 별칭만 갱신
+            for x in self._ip_list:
+                if x.get("ip") == dlg.ip:
+                    x["alias"] = dlg.alias
+                    break
+            else:
+                self._ip_list.append({"alias": dlg.alias, "ip": dlg.ip})
+            self._save_ip_list()
+            self._refresh_list_widget()
+            # 방금 추가/갱신한 항목 선택
+            self._select_ip_in_list(dlg.ip)
+
+    def _on_list_menu(self, pos):
+        item = self.list_ips.itemAt(pos)
+        if not item:
+            return
+        menu = QMenu(self)
+        act_edit = QAction("편집", self)
+        act_del  = QAction("삭제", self)
+        act_edit.triggered.connect(lambda: self._edit_ip_item(item))
+        act_del.triggered.connect(lambda: self._delete_ip_item(item))
+        menu.addAction(act_edit)
+        menu.addAction(act_del)
+        menu.exec(self.list_ips.viewport().mapToGlobal(pos))
+
+    def _edit_ip_item(self, item: QListWidgetItem):
+        data = item.data(Qt.UserRole) or {}
+        cur_alias = data.get("alias", "")
+        cur_ip = data.get("ip", "")
+        if not cur_ip:
+            return
+        dlg = IpEditDialog(self, title="IP 편집", ok_text="저장", alias=cur_alias, ip=cur_ip)
+        if dlg.exec() == QDialog.Accepted:
+            # 다른 항목과 IP 중복 체크
+            for x in self._ip_list:
+                if x.get("ip") == dlg.ip and x is not data:
+                    QMessageBox.warning(self, "확인", "이미 존재하는 IP입니다.")
+                    return
+            # 기존 항목 갱신: IP가 바뀌면 키를 바꿔야 하므로 교체
+            # self._ip_list는 dict 리스트이므로 대상 dict를 찾아 교체
+            for i, x in enumerate(self._ip_list):
+                if x.get("ip") == cur_ip and x.get("alias") == cur_alias:
+                    self._ip_list[i] = {"alias": dlg.alias, "ip": dlg.ip}
+                    break
+            self._save_ip_list()
+            self._refresh_list_widget()
+            self._select_ip_in_list(dlg.ip)
+
+    def _delete_ip_item(self, item: QListWidgetItem):
+        data = item.data(Qt.UserRole) or {}
+        ip = data.get("ip", "")
+        alias = data.get("alias", "")
+        if not ip:
+            return
+        ret = QMessageBox.question(self, "삭제 확인", f"선택한 항목을 삭제하시겠습니까?\n\n{alias} ({ip})")
+        if ret != QMessageBox.Yes:
+            return
+        self._ip_list = [x for x in self._ip_list if x.get("ip") != ip]
+        self._save_ip_list()
+        self._refresh_list_widget()
+
+    def _select_ip_in_list(self, ip: str):
+        for i in range(self.list_ips.count()):
+            it = self.list_ips.item(i)
+            data = it.data(Qt.UserRole)
+            if data and data.get("ip") == ip:
+                self.list_ips.setCurrentItem(it)
+                break
+
+
+    # --- 연결 시도 ---
     def try_connect(self):
         import socket
-        ip = self.ed_ip.text().strip()
-        if not ip:
-            self.lbl_err.setText("연결 실패: IP를 입력하세요.")
-            return
+        manual = self.cb_manual.isChecked()
+        if manual:
+            ip = self.ed_ip.text().strip()
+            if not ip:
+                self.lbl_err.setText("연결 실패: IP를 입력하세요.")
+                return
+        else:
+            item = self.list_ips.currentItem()
+            if not item:
+                self.lbl_err.setText("연결 실패: IP 리스트에서 선택하세요.")
+                return
+            data = item.data(Qt.UserRole) or {}
+            ip = data.get("ip","").strip()
+            if not ip:
+                self.lbl_err.setText("연결 실패: 선택한 항목에 IP가 없습니다.")
+                return
 
+        # probe: CONTROL → VIDEO → FILE 순
         def probe(port: int, timeout=2.0) -> bool:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -57,8 +315,13 @@ class ConnectDialog(QDialog):
             except Exception: return False
 
         ok = probe(CONTROL_PORT) or probe(VIDEO_PORT) or probe(FILE_PORT)
-        if ok: self.accept()
-        else:  self.lbl_err.setText("연결 실패: 서버에 연결할 수 없습니다.")
+        if ok:
+            # main.py가 ed_ip를 사용하므로 최종 IP를 주입
+            self.ed_ip.setText(ip)
+            self.accept()
+        else:
+            self.lbl_err.setText("연결 실패: 서버에 연결할 수 없습니다.")
+
 
 # ===================== 공통 뷰 스택(간단) =====================
 class QStackedWidgetSafe(QWidget):
