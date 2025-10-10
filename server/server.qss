@@ -1,0 +1,23 @@
+/* ===== 기본 ===== */
+QMainWindow, QWidget { background-color: #101922; color: #E5E7EB; }
+QLabel { color: #E5E7EB; font-size: 13px; }
+QStatusBar { background-color: #101922; color: #9CA3AF; }
+
+/* 제목 */
+#Title { font-size: 16px; font-weight: 700; }
+
+/* 연결 끊기 버튼 */
+#DisconnectBtn {
+  background-color: #dc3546;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-weight: 600;
+}
+#DisconnectBtn:hover   { background-color: #c12f3f; }
+#DisconnectBtn:pressed { background-color: #a82936; }
+#DisconnectBtn:disabled {
+  background-color: #374151;
+  color: #9CA3AF;
+}
