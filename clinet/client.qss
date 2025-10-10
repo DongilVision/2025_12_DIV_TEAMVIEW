@@ -1,0 +1,72 @@
+/* ===== 배경/텍스트 ===== */
+QMainWindow, QWidget { background-color: #101922; color: #E5E7EB; }
+QStatusBar { background-color: #101922; color: #9CA3AF; }
+QLabel { font-size: 13px; }
+
+/* ===== 헤더 ===== */
+#TopHeader { background-color: #101922; }
+#Title { font-size: 16px; font-weight: 700; color: #E5E7EB; }
+#Badge {
+  background-color: #0f1a1f;
+  border: 1px solid #233041;
+  border-radius: 8px;
+  color: #D1D5DB;
+  min-height: 28px;
+  padding: 3px 10px;
+}
+
+/* ===== 버튼 ===== */
+QPushButton {
+  background-color: #374151;
+  color: #E5E7EB;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+QPushButton:hover { background-color: #3e4857; }
+QPushButton:pressed { background-color: #495566; }
+QPushButton:disabled { background-color: #2a313c; color: #9CA3AF; }
+QPushButton:checked { background-color: #1173d4; }
+QPushButton:checked:hover { background-color: #2580d8; }
+QPushButton:checked:pressed { background-color: #2b89df; }
+QPushButton#btnExit { background-color: #dc3546; }
+QPushButton#btnExit:hover { background-color: #c12f3f; }
+QPushButton#btnExit:pressed { background-color: #a82936; }
+
+/* ===== 뷰어 ===== */
+#ViewerLabel { background: #0f1720; color: #9CA3AF; border: none; }
+
+/* ===== 파일 테이블 ===== */
+QTreeWidget {
+  background-color: #0f1720;
+  alternate-background-color: #0e151d;
+  border: 1px solid #233041;
+}
+QTreeWidget::item:selected { background-color: #17314a; color: #E5E7EB; }
+QHeaderView::section {
+  background-color: #0d1620;
+  color: #CBD5E1;
+  border: 1px solid #233041;
+  padding: 4px 6px;
+}
+
+/* ===== 입력/진행 ===== */
+QLineEdit {
+  background-color: #0f1720;
+  border: 1px solid #233041;
+  border-radius: 6px;
+  padding: 4px 6px;
+  color: #E5E7EB;
+}
+QProgressBar {
+  background-color: #0e151d;
+  border: 1px solid #233041;
+  border-radius: 6px;
+  text-align: center;
+  color: #CBD5E1;
+}
+QProgressBar::chunk { background-color: #1173d4; margin: 1px; border-radius: 5px; }
+
+/* ===== 연결 다이얼로그 ===== */
+#ConnectDialog { background-color: #101922; }
+#ConnectError  { color: #dc3546; padding-top: 6px; }

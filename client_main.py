@@ -1,5 +1,5 @@
 # client_main.py
-import sys, time, socket, struct, json, os, tempfile, zipfile, math
+import sys, time, socket, struct, json, os, tempfile, zipfile
 import numpy as np
 import cv2
 from datetime import datetime
@@ -9,12 +9,12 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QHBoxLayout, QVBoxLayout,
     QPushButton, QFrame, QLineEdit, QMessageBox, QSplitter, QProgressBar,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QStyle, QSizePolicy, QDialog
 )
 
 from common import VIDEO_PORT, CONTROL_PORT, FILE_PORT
 
-# ===== 공통 유틸 =====
+# ===================== 공통 유틸 =====================
 def np_bgr_to_qimage(bgr: np.ndarray) -> QImage:
     h, w, _ = bgr.shape
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -49,7 +49,7 @@ def fmt_mtime(epoch: float|int|None) -> str:
     except Exception:
         return ""
 
-# ===== Qt Key -> Windows VK =====
+# ===================== Qt Key -> Windows VK =====================
 VK = {
     "F1":0x70,"F2":0x71,"F3":0x72,"F4":0x73,"F5":0x74,"F6":0x75,"F7":0x76,"F8":0x77,
     "F9":0x78,"F10":0x79,"F11":0x7A,"F12":0x7B,"F13":0x7C,"F14":0x7D,"F15":0x7E,"F16":0x7F,
@@ -127,9 +127,9 @@ def qt_to_vk(e) -> int:
     if k == Qt.Key_Apostrophe:   return VK["OEM_7"]
     return 0
 
-# ===== 영상 스레드 =====
+# ===================== 영상 스레드 =====================
 class VideoClient(QThread):
-    sig_status = Signal(float, int, bool)
+    sig_status = Signal(float, int, bool, float)  # fps, elapsed, connected, mbps
     sig_frame  = Signal(QImage, int, int)
 
     def __init__(self, host: str, port: int):
@@ -138,6 +138,7 @@ class VideoClient(QThread):
         self._stop = False; self._sock = None
         self._connected = False; self._conn_ts = None
         self._frame_count = 0; self._last_fps_ts = time.time()
+        self._bytes_acc = 0
 
     def run(self):
         try:
@@ -146,7 +147,7 @@ class VideoClient(QThread):
             self._sock.settimeout(None)
             self._connected = True; self._conn_ts = time.time()
         except Exception:
-            self.sig_status.emit(0.0, 0, False); return
+            self.sig_status.emit(0.0, 0, False, 0.0); return
 
         try:
             while not self._stop:
@@ -155,6 +156,8 @@ class VideoClient(QThread):
                 data_len, w, h = struct.unpack(">III", hdr)
                 blob = recv_exact(self._sock, data_len)
                 if not blob: break
+                self._bytes_acc += 12 + len(blob)
+
                 arr = np.frombuffer(blob, dtype=np.uint8)
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if img is not None:
@@ -163,18 +166,21 @@ class VideoClient(QThread):
 
                 now = time.time()
                 if now - self._last_fps_ts >= 1.0:
-                    fps = float(self._frame_count); self._frame_count = 0; self._last_fps_ts = now
+                    fps = float(self._frame_count); self._frame_count = 0
                     elapsed = int(now - (self._conn_ts or now))
-                    self.sig_status.emit(fps, elapsed, self._connected)
+                    mbps = (self._bytes_acc * 8.0) / 1_000_000.0
+                    self._bytes_acc = 0
+                    self._last_fps_ts = now
+                    self.sig_status.emit(fps, elapsed, self._connected, mbps)
         finally:
             try:
                 if self._sock: self._sock.close()
             except Exception: pass
-            self._connected = False; self.sig_status.emit(0.0, 0, False)
+            self._connected = False; self.sig_status.emit(0.0, 0, False, 0.0)
 
     def stop(self): self._stop = True
 
-# ===== 제어 송신 =====
+# ===================== 제어 송신 =====================
 class ControlClient:
     def __init__(self, host:str, port:int):
         self.host=host; self.port=port; self.sock=None; self.connect()
@@ -206,7 +212,7 @@ class ControlClient:
     def send_key(self, vk:int, down:bool):
         if vk: self.send_json({"t":"key","vk":int(vk),"down":bool(down)})
 
-# ===== 파일/디렉토리 클라이언트 =====
+# ===================== 파일/디렉토리 클라이언트 =====================
 class FileClient:
     def __init__(self, host: str, port: int):
         self.host = host; self.port = port
@@ -366,7 +372,7 @@ class FileClient:
         tmp_dir = tempfile.gettempdir()
         if not zip_name:
             base = os.path.basename(os.path.abspath(src_paths[0])).rstrip("\\/")
-            zip_name = f"{base}_{int(time.time())}.zip"
+            zip_name = f"{base}_{int(time.now())}.zip"
         zpath = os.path.join(tmp_dir, zip_name)
         try:
             with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -390,29 +396,72 @@ class FileClient:
             except Exception:
                 pass
 
-# ===== 상단 상태바 =====
-class TopStatusBar(QFrame):
-    def __init__(self):
+# ===================== 상단 헤더바/배지 =====================
+class Badge(QLabel):
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.setObjectName("Badge")
+        self.setMinimumHeight(28)
+        self.setAlignment(Qt.AlignCenter)
+        self.setContentsMargins(10, 3, 10, 3)
+        self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+
+class TopHeader(QFrame):
+    def __init__(self, on_fullscreen, on_toggle_transfer, on_reconnect, on_exit):
         super().__init__()
-        self.setFrameShape(QFrame.NoFrame); self.setFixedHeight(24)
-        self.lbl_time = QLabel("경과 00:00:00"); self.lbl_fps=QLabel("FPS 0"); self.lbl_ip=QLabel("서버: -")
-        lay = QHBoxLayout(); lay.setContentsMargins(8,0,8,0); lay.setSpacing(16)
-        lay.addWidget(self.lbl_time); lay.addWidget(self.lbl_fps); lay.addWidget(self.lbl_ip); lay.addStretch(1)
-        self.setLayout(lay)
+        self.setObjectName("TopHeader")
+        self.setFixedHeight(56)
+
+        # 좌측 타이틀
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(self.style().standardIcon(QStyle.SP_ComputerIcon).pixmap(20,20))
+        title = QLabel("원격 제어"); title.setObjectName("Title")
+        left = QHBoxLayout(); left.setContentsMargins(12,0,0,0); left.setSpacing(8)
+        left.addWidget(icon_lbl); left.addWidget(title)
+        left_wrap = QWidget(); left_wrap.setLayout(left)
+
+        # 중앙 배지
+        self.badge_time = Badge("⏱ 00:00:00")
+        self.badge_bw   = Badge("⇅ 0 Mbps")
+        self.badge_ip   = Badge("서버 IP: -")
+        center = QHBoxLayout(); center.setContentsMargins(0,0,0,0); center.setSpacing(8)
+        center.addStretch(1); center.addWidget(self.badge_time); center.addWidget(self.badge_bw); center.addWidget(self.badge_ip); center.addStretch(1)
+        center_wrap = QWidget(); center_wrap.setLayout(center)
+
+        # 우측 버튼
+        self.btn_full = QPushButton("전체 화면"); self.btn_full.clicked.connect(on_fullscreen)
+        self.btn_transfer = QPushButton("파일 전달"); self.btn_transfer.setCheckable(True); self.btn_transfer.clicked.connect(on_toggle_transfer)
+        self.btn_re = QPushButton("재연결"); self.btn_re.clicked.connect(on_reconnect)
+        self.btn_exit = QPushButton("원격 종료"); self.btn_exit.setObjectName("btnExit"); self.btn_exit.clicked.connect(on_exit)
+        right = QHBoxLayout(); right.setContentsMargins(0,0,12,0); right.setSpacing(8)
+        for b in [self.btn_full, self.btn_transfer, self.btn_re, self.btn_exit]:
+            right.addWidget(b)
+        right_wrap = QWidget(); right_wrap.setLayout(right)
+
+        lay = QHBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
+        lay.addWidget(left_wrap, 0)
+        lay.addWidget(center_wrap, 1)
+        lay.addWidget(right_wrap, 0)
+
     def update_time(self, seconds:int):
         h=seconds//3600; m=(seconds%3600)//60; s=seconds%60
-        self.lbl_time.setText(f"경과 {h:02d}:{m:02d}:{s:02d}")
-    def update_fps(self, fps:float): self.lbl_fps.setText(f"FPS {int(fps)}")
-    def update_ip(self, ip_text:str): self.lbl_ip.setText(f"서버: {ip_text}")
+        self.badge_time.setText(f"⏱ {h:02d}:{m:02d}:{s:02d}")
+    def update_bw(self, mbps:float):
+        self.badge_bw.setText(f"⇅ {mbps:.0f} Mbps")
+    def update_ip(self, ip_text:str):
+        self.badge_ip.setText(f"서버 IP: {ip_text}")
 
-# ===== 원격 화면 라벨 =====
+# ===================== 원격 화면 라벨 =====================
 class ViewerLabel(QLabel):
     sig_mouse = Signal(dict)
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("ViewerLabel")
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.remote_size = (0,0)
+        self.setAlignment(Qt.AlignCenter)
+        self.setText("원격 화면\n\n원격 PC 화면이 여기에 표시됩니다.")
     def set_remote_size(self, w:int, h:int): self.remote_size = (w,h)
     def map_to_remote(self, p: QPoint) -> tuple[int,int]:
         rw, rh = self.remote_size
@@ -437,7 +486,7 @@ class ViewerLabel(QLabel):
         self.sig_mouse.emit({"t":"up","btn":btn,"x":e.position().x(),"y":e.position().y()})
     def wheelEvent(self, e): self.sig_mouse.emit({"t":"wheel","delta":e.angleDelta().y()})
 
-# ===== 파일 테이블 위젯(탐색기 스타일) =====
+# ===================== 파일 테이블 =====================
 class FileTable(QTreeWidget):
     sig_copy = Signal()
     sig_paste = Signal()
@@ -457,31 +506,26 @@ class FileTable(QTreeWidget):
         self.dir_icon = self.style().standardIcon(QStyle.SP_DirIcon)
         self.file_icon = self.style().standardIcon(QStyle.SP_FileIcon)
         self.setUniformRowHeights(True)
-
     def keyPressEvent(self, e):
         if (e.modifiers() & Qt.ControlModifier) and e.key()==Qt.Key_C:
             self.sig_copy.emit(); return
         if (e.modifiers() & Qt.ControlModifier) and e.key()==Qt.Key_V:
             self.sig_paste.emit(); return
         super().keyPressEvent(e)
-
     def add_entry(self, name:str, is_dir:bool, full_path:str, size:int|None, mtime:float|None):
-        # 유형/크기/날짜 문자열
         ftype = "폴더" if is_dir else (f"{os.path.splitext(name)[1][1:].upper()} 파일" if os.path.splitext(name)[1] else "파일")
         size_str = "" if is_dir else human_size(size or 0)
         mtime_str = fmt_mtime(mtime)
         it = QTreeWidgetItem([name, mtime_str, ftype, size_str])
         it.setData(0, Qt.UserRole, {"name": name, "is_dir": is_dir, "path": full_path})
         it.setIcon(0, self.dir_icon if is_dir else self.file_icon)
-        # 정렬용 데이터(숫자/시간)
         it.setData(1, Qt.UserRole+1, mtime or 0.0)
         it.setData(3, Qt.UserRole+1, size or (0 if is_dir else 0))
-        # 크기 오른쪽 정렬
         it.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
         self.addTopLevelItem(it)
         return it
 
-# ===== 전송 작업 스레드 =====
+# ===================== 전송 스레드 =====================
 class TransferThread(QThread):
     prog = Signal(int, int)     # done, total
     done = Signal(bool, str)    # ok, msg
@@ -497,12 +541,12 @@ class TransferThread(QThread):
             ok, msg = False, str(ex)
         self.done.emit(bool(ok), str(msg))
 
-# ===== 파일 전달 페이지 =====
+# ===================== 파일 전달 페이지 =====================
 class FileTransferPage(QWidget):
     def __init__(self, fc: 'FileClient', parent=None):
         super().__init__(parent)
         self.fc = fc
-        self.clip = None  # {"type":"local"|"server", "paths":[...]}
+        self.clip = None
         self._xfer_thread = None
 
         # 좌(서버)
@@ -531,7 +575,7 @@ class FileTransferPage(QWidget):
         self.btn_right_send.clicked.connect(self.on_right_send)
         self.btn_right_zip.clicked.connect(self.on_right_zip)
 
-        # 레이아웃(헤더)
+        # 레이아웃
         header_l = QHBoxLayout(); header_l.addWidget(self.lbl_left); header_l.addWidget(self.ed_left, 1); header_l.addWidget(self.btn_left_send); header_l.addWidget(self.btn_left_zip)
         header_r = QHBoxLayout(); header_r.addWidget(self.lbl_right); header_r.addWidget(self.ed_right, 1); header_r.addWidget(self.btn_right_send); header_r.addWidget(self.btn_right_zip)
         left_wrap = QVBoxLayout(); left_wrap.addLayout(header_l); left_wrap.addWidget(self.left_table, 1)
@@ -540,7 +584,7 @@ class FileTransferPage(QWidget):
         right_w = QWidget(); right_w.setLayout(right_wrap)
         spl = QSplitter(); spl.addWidget(left_w); spl.addWidget(right_w); spl.setSizes([600, 600])
 
-        # 진행률 영역
+        # 진행률
         self.prog = QProgressBar(); self.prog.setRange(0,100); self.prog.setValue(0)
         self.lbl_prog = QLabel("")
         prog_lay = QHBoxLayout(); prog_lay.addWidget(QLabel("전송 진행:")); prog_lay.addWidget(self.prog, 1); prog_lay.addWidget(self.lbl_prog)
@@ -558,64 +602,47 @@ class FileTransferPage(QWidget):
         self.left_table.itemDoubleClicked.connect(self.on_double_left)
         self.right_table.itemDoubleClicked.connect(self.on_double_right)
 
-    # 상태 질의/대기 (스레드 안전 종료용)
+    # 상태 질의/대기
     def has_running_transfer(self) -> bool:
         return (self._xfer_thread is not None) and self._xfer_thread.isRunning()
-
     def wait_transfer_finish(self, timeout_ms: int | None = None):
         if self._xfer_thread is not None:
-            if timeout_ms is None:
-                self._xfer_thread.wait()
-            else:
-                self._xfer_thread.wait(timeout_ms)
+            if timeout_ms is None: self._xfer_thread.wait()
+            else: self._xfer_thread.wait(timeout_ms)
 
-    # --- 목록 갱신 ---
+    # 목록 갱신
     def refresh_server(self, path: str|None):
         resp = self.fc.list_dir_server(path)
         self.left_table.clear()
         if not resp.get("ok"):
             self.ed_left.setText(resp.get("error","에러")); return
         self.server_cwd = resp["path"]; self.ed_left.setText(self.server_cwd)
-
-        # 상위 폴더
         up = os.path.dirname(self.server_cwd)
         if up and up != self.server_cwd:
             it = self.left_table.add_entry("..", True, up, None, None)
             it.setForeground(0, self.palette().brush(self.foregroundRole()))
-
-        # 항목 채우기
         items = resp.get("items", [])
-        # 디렉터리 우선 정렬
         items.sort(key=lambda x:(not x.get("is_dir",False), x.get("name","").lower()))
         for m in items:
             full = os.path.join(self.server_cwd, m["name"])
             self.left_table.add_entry(m["name"], bool(m["is_dir"]), full, int(m.get("size",0)), float(m.get("mtime",0)))
-
         self.left_table.sortItems(0, Qt.AscendingOrder)
 
     def refresh_local(self, path: str):
         path = os.path.abspath(path)
         self.local_cwd = path; self.ed_right.setText(self.local_cwd)
         self.right_table.clear()
-
-        # 상위 폴더
         up = os.path.dirname(self.local_cwd)
         if up and up != self.local_cwd:
             it = self.right_table.add_entry("..", True, up, None, None)
             it.setForeground(0, self.palette().brush(self.foregroundRole()))
-
         try:
             with os.scandir(self.local_cwd) as iters:
                 entries = []
                 for e in iters:
                     try:
                         st = e.stat()
-                        entries.append({
-                            "name": e.name,
-                            "is_dir": e.is_dir(),
-                            "size": int(st.st_size),
-                            "mtime": float(st.st_mtime)
-                        })
+                        entries.append({"name": e.name,"is_dir": e.is_dir(),"size": int(st.st_size),"mtime": float(st.st_mtime)})
                     except Exception:
                         pass
             entries.sort(key=lambda x:(not x["is_dir"], x["name"].lower()))
@@ -626,20 +653,17 @@ class FileTransferPage(QWidget):
         except Exception as ex:
             self.right_table.addTopLevelItem(QTreeWidgetItem([f"[ERROR] {ex!s}","","",""]))
 
-    # --- 더블클릭 이동 ---
+    # 더블클릭 이동
     def on_double_left(self, item: QTreeWidgetItem):
         meta = item.data(0, Qt.UserRole)
-        if not meta: return
-        if meta.get("is_dir"):  # 파일 더블클릭은 무시
+        if meta and meta.get("is_dir"):
             self.refresh_server(meta["path"])
-
     def on_double_right(self, item: QTreeWidgetItem):
         meta = item.data(0, Qt.UserRole)
-        if not meta: return
-        if meta.get("is_dir"):
+        if meta and meta.get("is_dir"):
             self.refresh_local(meta["path"])
 
-    # --- 버튼 활성화 갱신 ---
+    # 버튼 활성화
     def update_buttons(self):
         def has_valid(items):
             for it in items:
@@ -652,7 +676,7 @@ class FileTransferPage(QWidget):
         self.btn_right_send.setEnabled(has_valid(self.right_table.selectedItems()))
         self.btn_right_zip.setEnabled(has_valid(self.right_table.selectedItems()))
 
-    # --- 복사/붙여넣기 (기존: 파일만) ---
+    # 복사/붙여넣기 (파일만)
     def copy_from_server(self):
         paths = []
         for it in self.left_table.selectedItems():
@@ -687,7 +711,7 @@ class FileTransferPage(QWidget):
         self.run_transfer(lambda cb: self.fc.download_paths(self.clip["paths"], self.local_cwd, progress=cb),
                           after=lambda ok: self.refresh_local(self.local_cwd))
 
-    # --- 전달 버튼 동작(폴더 포함) ---
+    # 전달 버튼(폴더 지원)
     def _selected_paths(self, table: FileTable):
         return [it.data(0, Qt.UserRole)["path"] for it in table.selectedItems()
                 if it.data(0, Qt.UserRole) and it.data(0, Qt.UserRole)["name"]!=".."]
@@ -716,7 +740,7 @@ class FileTransferPage(QWidget):
         self.run_transfer(lambda cb: self.fc.upload_zip_of_local(self.server_cwd, sel, zip_name=None, progress=cb),
                           after=lambda ok: self.refresh_server(self.server_cwd))
 
-    # --- 전송 실행/진행률 UI (스레드 보관/정리 포함) ---
+    # 전송 실행/진행률 UI
     def run_transfer(self, op_callable, after=None):
         if self.has_running_transfer():
             self.window().statusBar().showMessage("이미 전송 작업이 실행 중입니다.", 3000)
@@ -759,7 +783,7 @@ class FileTransferPage(QWidget):
             self.lbl_prog.setText("전송 실패")
             self.window().statusBar().showMessage("전송 실패: " + msg, 5000)
 
-# ===== 간단 스택 위젯 =====
+# ===================== 간단 스택 위젯 =====================
 class QStackedWidgetSafe(QWidget):
     def __init__(self):
         super().__init__()
@@ -777,7 +801,7 @@ class QStackedWidgetSafe(QWidget):
     def currentIndex(self): return self._idx
     def widget(self, i:int): return self._stack[i]
 
-# ===== 메인 윈도우 =====
+# ===================== 메인 윈도우 =====================
 class ClientWindow(QMainWindow):
     def __init__(self, server_ip: str):
         super().__init__()
@@ -785,55 +809,49 @@ class ClientWindow(QMainWindow):
         self.resize(1180, 760)
         self.server_ip = server_ip
 
-        # 상단 바 + 컨트롤
-        self.topbar = TopStatusBar(); self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
-        self.btn_full = QPushButton("전체크기"); self.btn_full.clicked.connect(self.on_fullscreen)
-        self.btn_transfer = QPushButton("파일 전달"); self.btn_transfer.setCheckable(True); self.btn_transfer.clicked.connect(self.toggle_transfer_page)
-
-        self.ed_ip = QLineEdit(self.server_ip); self.ed_ip.setFixedWidth(160)
-        self.btn_re = QPushButton("재연결"); self.btn_re.clicked.connect(self.on_reconnect)
-
-        ctrl = QHBoxLayout(); ctrl.setContentsMargins(8,4,8,4); ctrl.setSpacing(8)
-        ctrl.addWidget(self.btn_full); ctrl.addWidget(self.btn_transfer)
-        ctrl.addStretch(1)
-        ctrl.addWidget(QLabel("서버 IP:")); ctrl.addWidget(self.ed_ip); ctrl.addWidget(self.btn_re)
+        # 상단 헤더
+        self.header = TopHeader(self.on_fullscreen, self.toggle_transfer_page, self.on_reconnect, self.on_exit)
+        self.header.update_ip(f"{self.server_ip}: V{VIDEO_PORT} / C{CONTROL_PORT} / F{FILE_PORT}")
 
         # 페이지 1: 원격 뷰어
-        self.view = ViewerLabel("원격 화면 수신 대기")
-        self.view.setAlignment(Qt.AlignCenter); self.view.setStyleSheet("background:#202020; color:#DDDDDD;")
-        self.view.sig_mouse.connect(self.on_mouse_local)
-        viewer_layout = QVBoxLayout(); viewer_layout.addWidget(self.view, 1)
+        self.view = ViewerLabel()
+        viewer_layout = QVBoxLayout(); viewer_layout.setContentsMargins(12,12,12,12); viewer_layout.addWidget(self.view, 1)
         self.page_viewer = QWidget(); self.page_viewer.setLayout(viewer_layout)
 
         # 페이지 2: 파일 전달
         self.fc = FileClient(self.server_ip, FILE_PORT)
         self.page_transfer = FileTransferPage(self.fc)
 
-        # 스택: 토글 표시
+        # 스택
         self.stack = QStackedWidgetSafe()
         self.stack.addWidget(self.page_viewer)   # index 0
         self.stack.addWidget(self.page_transfer) # index 1
 
-        root = QVBoxLayout(); root.addWidget(self.topbar); root.addLayout(ctrl); root.addWidget(self.stack, 1)
+        root = QVBoxLayout(); root.setContentsMargins(0,0,0,0)
+        root.addWidget(self.header)
+        root.addWidget(self.stack, 1)
         wrap = QWidget(); wrap.setLayout(root); self.setCentralWidget(wrap)
 
         # 네트워크
-        self.vc = VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status); self.vc.sig_frame.connect(self.on_frame); self.vc.start()
-        self.cc = ControlClient(self.server_ip, CONTROL_PORT)
+        self.vc = VideoClient(self.server_ip, VIDEO_PORT)
+        self.vc.sig_status.connect(self.on_status)
+        self.vc.sig_frame.connect(self.on_frame)
+        self.vc.start()
 
+        self.cc = ControlClient(self.server_ip, CONTROL_PORT)
         self.view.setFocusPolicy(Qt.StrongFocus)
 
-    # --- 토글: 파일 전달 페이지 ---
-    def toggle_transfer_page(self, checked: bool):
+    def toggle_transfer_page(self):
+        checked = self.header.btn_transfer.isChecked()
         self.stack.setCurrentIndex(1 if checked else 0)
         if checked:
             self.statusBar().showMessage("파일 전달 모드: 좌(서버) / 우(클라이언트). Ctrl+C / Ctrl+V 또는 상단 버튼 사용", 5000)
         else:
             self.statusBar().clearMessage()
 
-    # --- 상태/프레임 ---
-    def on_status(self, fps:float, elapsed:int, connected:bool):
-        self.topbar.update_fps(fps); self.topbar.update_time(elapsed if connected else 0)
+    def on_status(self, fps:float, elapsed:int, connected:bool, mbps:float):
+        self.header.update_time(elapsed if connected else 0)
+        self.header.update_bw(mbps)
         if not connected and self.stack.currentIndex()==0:
             self.view.setText("연결 끊김")
 
@@ -852,10 +870,8 @@ class ClientWindow(QMainWindow):
             self.redraw(self.view.pixmap().toImage())
         super().resizeEvent(e)
 
-    # --- 마우스/키 → 제어 ---
     def on_mouse_local(self, ev:dict):
-        if self.stack.currentIndex()!=0:
-            return
+        if self.stack.currentIndex()!=0: return
         cursor = QPoint(int(ev.get("x",0)), int(ev.get("y",0)))
         rx, ry = self.view.map_to_remote(cursor)
         t = ev.get("t")
@@ -885,30 +901,26 @@ class ClientWindow(QMainWindow):
         else:
             super().keyReleaseEvent(e)
 
-    # --- 기타 ---
     def on_fullscreen(self):
         if self.isFullScreen(): self.showNormal()
         else: self.showFullScreen()
 
     def on_reconnect(self):
-        ip = self.ed_ip.text().strip()
-        if not ip:
-            QMessageBox.warning(self,"알림","IP를 입력하세요."); return
-        self.server_ip = ip
-        self.topbar.update_ip(f"{self.server_ip}: V{VIDEO_PORT}/C{CONTROL_PORT}/F{FILE_PORT}")
+        self.header.update_ip(f"{self.server_ip}: V{VIDEO_PORT} / C{CONTROL_PORT} / F{FILE_PORT}")
         try:
             self.vc.stop(); self.vc.wait(1000)
         except Exception:
             pass
         self.vc = VideoClient(self.server_ip, VIDEO_PORT); self.vc.sig_status.connect(self.on_status); self.vc.sig_frame.connect(self.on_frame); self.vc.start()
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
-        # 파일 클라이언트 갱신
         self.fc = FileClient(self.server_ip, FILE_PORT)
         self.page_transfer.fc = self.fc
         self.page_transfer.refresh_server(None)
 
+    def on_exit(self):
+        self.close()
+
     def closeEvent(self, e):
-        # 전송 스레드가 동작 중이면 먼저 대기
         try:
             if hasattr(self, "page_transfer") and self.page_transfer and \
                hasattr(self.page_transfer, "has_running_transfer") and \
@@ -927,10 +939,78 @@ class ClientWindow(QMainWindow):
             pass
         super().closeEvent(e)
 
+# ===================== 연결 다이얼로그(200×200) =====================
+class ConnectDialog(QDialog):
+    def __init__(self, default_ip: str | None = None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ConnectDialog")
+        self.setWindowTitle("원격 연결")
+        self.setFixedSize(250, 220)
+
+        lbl_title = QLabel("서버 IP"); ed = QLineEdit()
+        if default_ip: ed.setText(default_ip)
+        ed.setPlaceholderText("예: 192.168.1.100")
+        btn = QPushButton("연결")
+        self.lbl_err = QLabel(""); self.lbl_err.setObjectName("ConnectError")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14,14,14,14); lay.setSpacing(10)
+        lay.addWidget(lbl_title)
+        lay.addWidget(ed)
+        lay.addStretch(1)
+        lay.addWidget(btn)
+        lay.addWidget(self.lbl_err)
+
+        self.ed_ip = ed
+        btn.clicked.connect(self.try_connect)
+        ed.returnPressed.connect(self.try_connect)
+
+    def try_connect(self):
+        ip = self.ed_ip.text().strip()
+        if not ip:
+            self.lbl_err.setText("연결 실패: IP를 입력하세요.")
+            return
+        ok = self._probe(ip, CONTROL_PORT, timeout=2.0)   # 제어 포트로 빠르게 점검
+        if not ok:
+            # 영상/파일 포트도 한 번 시도(환경에 따라 열려있는 포트가 다를 수 있음)
+            ok = self._probe(ip, VIDEO_PORT, timeout=2.0) or self._probe(ip, FILE_PORT, timeout=2.0)
+        if ok:
+            self.accept()
+        else:
+            self.lbl_err.setText("연결 실패: 서버에 연결할 수 없습니다.")
+
+    @staticmethod
+    def _probe(ip: str, port: int, timeout: float = 2.0) -> bool:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, port))
+            s.close()
+            return True
+        except Exception:
+            return False
+
+# ===================== 진입점 =====================
 def main():
-    server_ip = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     app = QApplication(sys.argv)
-    w = ClientWindow(server_ip); w.show()
+
+    # 외부 QSS 로드
+    css_path = os.path.join(os.path.dirname(__file__), "client_main_css.qss")
+    try:
+        with open(css_path, "r", encoding="utf-8") as f:
+            app.setStyleSheet(f.read())
+    except Exception:
+        pass  # 스타일 파일이 없어도 실행되도록
+
+    # 연결 다이얼로그 표시
+    default_ip = sys.argv[1] if len(sys.argv) > 1 else None
+    dlg = ConnectDialog(default_ip=default_ip)
+    if dlg.exec() != QDialog.Accepted:
+        sys.exit(0)
+
+    server_ip = dlg.ed_ip.text().strip()
+    w = ClientWindow(server_ip)
+    w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
