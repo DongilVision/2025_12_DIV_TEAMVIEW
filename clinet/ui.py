@@ -1,12 +1,12 @@
 # client/ui.py
 import os
-from PySide6.QtCore import Qt, QPoint, Signal
-from PySide6.QtGui import QImage, QPixmap, QIcon, QAction
+from PySide6.QtCore import Qt, QPoint, Signal, QEvent, QTimer, QSize
+from PySide6.QtGui import QImage, QPixmap, QIcon, QAction, QCursor, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QStyle, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QSplitter, QProgressBar, QMessageBox, QSizePolicy,
-    QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox, QAbstractItemView, QMenu
+    QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox, QAbstractItemView, QMenu, QApplication, QGraphicsDropShadowEffect
 )
 from utils import qt_to_vk, human_size, fmt_mtime
 from net import VideoClient, ControlClient, FileClient
@@ -672,39 +672,70 @@ class FileTransferPage(QWidget):
         pct = int(done*100/total) if total>0 else 0
         self.prog.setValue(pct); self.lbl_prog.setText(f"남은 {max(0,100-pct)}%")
 
-# ===================== 메인 윈도우 =====================
+# 필요한 모듈 임포트 (파일 상단에 이미 있다면 중복 제거 가능)
+from PySide6.QtCore import Qt, QPoint, QTimer, QEvent
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QMessageBox, QApplication
+)
+
+from common import VIDEO_PORT, CONTROL_PORT, FILE_PORT
+from net import VideoClient, ControlClient, FileClient
+from utils import qt_to_vk
+
+# ----------------------------------------------------------------------
+# ClientWindow: 메인 클라이언트 창
+#  - 상단 헤더(배지/버튼), 원격 화면 뷰, 파일전달 페이지(Stack)
+#  - 몰입형 전체화면(프레임리스) + 상단 접근 시 "중앙 X 버튼" 노출
+# ----------------------------------------------------------------------
 class ClientWindow(QMainWindow):
-    def __init__(self, server_ip:str):
+    def __init__(self, server_ip: str):
         super().__init__()
         self.setWindowTitle("원격 뷰어 클라이언트")
         self.resize(1180, 760)
         self.server_ip = server_ip
 
-        # 헤더
+        # --- 헤더/배지/버튼 ---
         self.header = TopHeader(self.on_fullscreen, self.toggle_transfer_page, self.on_reconnect, self.on_exit)
         self.header.update_ip(f"{self.server_ip}: V{VIDEO_PORT} / C{CONTROL_PORT} / F{FILE_PORT}")
 
-        # 페이지: 뷰어
+        # --- 페이지: 원격 뷰어 ---
         self.view = ViewerLabel()
-        vlay = QVBoxLayout(); vlay.setContentsMargins(12,12,12,12); vlay.addWidget(self.view,1)
-        self.page_viewer = QWidget(); self.page_viewer.setLayout(vlay)
+        vlay = QVBoxLayout()
+        vlay.setContentsMargins(12, 12, 12, 12)
+        vlay.addWidget(self.view, 1)
+        self.page_viewer = QWidget()
+        self.page_viewer.setLayout(vlay)
         self.view.sig_mouse.connect(self.on_mouse_local)
 
-        # 페이지: 파일 전달
+        # 몰입형 전체화면 시 여백/상태 저장용
+        self._viewer_layout = vlay
+        self._viewer_margin_norm = (12, 12, 12, 12)
+        self._immersive = False
+        self._filter_installed = False  # 전역 이벤트 필터 설치 여부
+
+        # --- 페이지: 파일 전달 ---
         self.fc = FileClient(self.server_ip, FILE_PORT)
         self.page_transfer = FileTransferPage(self.fc)
 
-        # 스택
+        # --- 스택 구성 ---
         self.stack = QStackedWidgetSafe()
-        self.stack.addWidget(self.page_viewer)   # 0
-        self.stack.addWidget(self.page_transfer) # 1
+        self.stack.addWidget(self.page_viewer)    # index 0
+        self.stack.addWidget(self.page_transfer)  # index 1
 
-        # 루트 레이아웃
-        root = QVBoxLayout(); root.setContentsMargins(0,0,0,0)
-        root.addWidget(self.header); root.addWidget(self.stack,1)
-        wrap = QWidget(); wrap.setLayout(root); self.setCentralWidget(wrap)
+        # --- 루트 레이아웃 ---
+        root = QVBoxLayout()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self.header)
+        root.addWidget(self.stack, 1)
+        wrap = QWidget()
+        wrap.setLayout(root)
+        self.setCentralWidget(wrap)
 
-        # 네트워크
+        # 상태바 초기화
+        self.statusBar()
+
+        # --- 네트워크(영상/제어) ---
         self.vc = VideoClient(self.server_ip, VIDEO_PORT)
         self.vc.sig_status.connect(self.on_status)
         self.vc.sig_frame.connect(self.on_frame)
@@ -712,71 +743,93 @@ class ClientWindow(QMainWindow):
 
         self.cc = ControlClient(self.server_ip, CONTROL_PORT)
 
-    # 헤더 토글
+        # --- 몰입형 전체화면: 중앙 X 버튼 오버레이 초기화 ---
+        self._init_immersive_close_button()
+
+    # ===================== 파일전달/페이지 토글 =====================
     def toggle_transfer_page(self):
         chk = self.header.btn_transfer.isChecked()
+        # 파일전달 페이지 진입 시, 몰입형 전체화면이면 해제
+        if chk and self._immersive:
+            self.on_fullscreen()
         self.stack.setCurrentIndex(1 if chk else 0)
-        if chk: self.statusBar().showMessage("파일 전달 모드입니다. Ctrl+C/Ctrl+V 사용 가능.",5000)
-        else:   self.statusBar().clearMessage()
+        if chk:
+            self.statusBar().showMessage("파일 전달 모드입니다. Ctrl+C/Ctrl+V 사용 가능.", 5000)
+        else:
+            self.statusBar().clearMessage()
 
-    # 상태/프레임
-    def on_status(self, fps:float, elapsed:int, connected:bool, mbps:float):
+    # ===================== 상태/프레임 수신 =====================
+    def on_status(self, fps: float, elapsed: int, connected: bool, mbps: float):
         self.header.update_time(elapsed if connected else 0)
         self.header.update_bw(mbps)
-        if not connected and self.stack.currentIndex()==0:
+        if not connected and self.stack.currentIndex() == 0:
             self.view.setText("연결 끊김")
 
-    def on_frame(self, qimg:QImage, w:int, h:int):
-        if self.stack.currentIndex()==0:
-            self.view.set_remote_size(w,h)
+    def on_frame(self, qimg, w: int, h: int):
+        if self.stack.currentIndex() == 0:
+            self.view.set_remote_size(w, h)
             pm = QPixmap.fromImage(qimg)
             scaled = pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.view.setPixmap(scaled)
 
     def resizeEvent(self, e):
-        if self.stack.currentIndex()==0 and self.view.pixmap() and not self.view.pixmap().isNull():
-            pm = self.view.pixmap(); 
+        # 원격 화면 리스케일
+        if self.stack.currentIndex() == 0 and self.view.pixmap() and not self.view.pixmap().isNull():
+            pm = self.view.pixmap()
             self.view.setPixmap(pm.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # 중앙 X 버튼 위치 동기화
+        self._layout_immersive_close()
         super().resizeEvent(e)
 
-    # 입력 → 서버 제어
-    def on_mouse_local(self, ev:dict):
-        if self.stack.currentIndex()!=0: return
-        cursor = QPoint(int(ev.get("x",0)), int(ev.get("y",0)))
+    def moveEvent(self, e):
+        self._layout_immersive_close()
+        super().moveEvent(e)
+
+    def showEvent(self, e):
+        self._layout_immersive_close()
+        super().showEvent(e)
+
+    # ===================== 입력 전달(마우스/키보드) =====================
+    def on_mouse_local(self, ev: dict):
+        if self.stack.currentIndex() != 0:
+            return
+        cursor = QPoint(int(ev.get("x", 0)), int(ev.get("y", 0)))
         rx, ry = self.view.map_to_remote(cursor)
         t = ev.get("t")
-        if t=="move":
-            self.cc.send_json({"t":"mouse_move","x":rx,"y":ry})
-        elif t=="down":
-            self.cc.send_json({"t":"mouse_move","x":rx,"y":ry})
-            self.cc.send_json({"t":"mouse_down","btn": ev.get("btn","left")})
-        elif t=="up":
-            self.cc.send_json({"t":"mouse_up","btn": ev.get("btn","left")})
-        elif t=="wheel":
-            self.cc.send_json({"t":"mouse_wheel","delta": int(ev.get("delta",0))})
+        if t == "move":
+            self.cc.send_json({"t": "mouse_move", "x": rx, "y": ry})
+        elif t == "down":
+            self.cc.send_json({"t": "mouse_move", "x": rx, "y": ry})
+            self.cc.send_json({"t": "mouse_down", "btn": ev.get("btn", "left")})
+        elif t == "up":
+            self.cc.send_json({"t": "mouse_up", "btn": ev.get("btn", "left")})
+        elif t == "wheel":
+            self.cc.send_json({"t": "mouse_wheel", "delta": int(ev.get("delta", 0))})
 
     def keyPressEvent(self, e):
-        if self.stack.currentIndex()==0 and not e.isAutoRepeat():
+        if self.stack.currentIndex() == 0 and not e.isAutoRepeat():
             vk = qt_to_vk(e)
-            if vk: self.cc.send_json({"t":"key","vk":int(vk),"down":True})
+            if vk:
+                self.cc.send_json({"t": "key", "vk": int(vk), "down": True})
         else:
             super().keyPressEvent(e)
+
     def keyReleaseEvent(self, e):
-        if self.stack.currentIndex()==0 and not e.isAutoRepeat():
+        if self.stack.currentIndex() == 0 and not e.isAutoRepeat():
             vk = qt_to_vk(e)
-            if vk: self.cc.send_json({"t":"key","vk":int(vk),"down":False})
+            if vk:
+                self.cc.send_json({"t": "key", "vk": int(vk), "down": False})
         else:
             super().keyReleaseEvent(e)
 
-    # 버튼 핸들러
-    def on_fullscreen(self):
-        self.showNormal() if self.isFullScreen() else self.showFullScreen()
-
+    # ===================== 재연결/종료 =====================
     def on_reconnect(self):
         self.header.update_ip(f"{self.server_ip}: V{VIDEO_PORT} / C{CONTROL_PORT} / F{FILE_PORT}")
         try:
-            self.vc.stop(); self.vc.wait(1000)
-        except Exception: pass
+            self.vc.stop()
+            self.vc.wait(1000)
+        except Exception:
+            pass
         self.vc = VideoClient(self.server_ip, VIDEO_PORT)
         self.vc.sig_status.connect(self.on_status)
         self.vc.sig_frame.connect(self.on_frame)
@@ -787,7 +840,8 @@ class ClientWindow(QMainWindow):
         self.page_transfer.fc = self.fc
         self.page_transfer.refresh_server(None)
 
-    def on_exit(self): self.close()
+    def on_exit(self):
+        self.close()
 
     def closeEvent(self, e):
         # 파일 전송 중이면 종료 보류
@@ -796,10 +850,162 @@ class ClientWindow(QMainWindow):
                 self.statusBar().showMessage("파일 전송 마무리 중…", 3000)
                 self.page_transfer.wait_transfer_finish(15000)
                 if self.page_transfer.has_running_transfer():
-                    QMessageBox.warning(self,"알림","파일 전송이 진행 중입니다. 완료 후 종료해 주세요.")
-                    e.ignore(); return
-        except Exception: pass
+                    QMessageBox.warning(self, "알림", "파일 전송이 진행 중입니다. 완료 후 종료해 주세요.")
+                    e.ignore()
+                    return
+        except Exception:
+            pass
         try:
-            self.vc.stop(); self.vc.wait(1000)
-        except Exception: pass
+            self.vc.stop()
+            self.vc.wait(1000)
+        except Exception:
+            pass
         super().closeEvent(e)
+
+    # ===================== 몰입형 전체화면(프레임리스) =====================
+    def on_fullscreen(self):
+        self._immersive = not getattr(self, "_immersive", False)
+        self._apply_immersive(self._immersive)
+
+    def _set_global_filter(self, enable: bool):
+        app = QApplication.instance()
+        if not app:
+            return
+        if enable and not getattr(self, "_filter_installed", False):
+            app.installEventFilter(self)
+            self._filter_installed = True
+        elif not enable and getattr(self, "_filter_installed", False):
+            app.removeEventFilter(self)
+            self._filter_installed = False
+
+    def _apply_immersive(self, state: bool):
+        if state:
+            # 프레임 제거 + 헤더/상태바 숨김 + 여백 제거 + 뷰어 페이지 고정
+            self.setWindowFlag(Qt.FramelessWindowHint, True)
+            self.header.setVisible(False)
+            self.statusBar().setVisible(False)
+            self._viewer_layout.setContentsMargins(0, 0, 0, 0)
+            self.stack.setCurrentIndex(0)
+
+            # 전역 마우스 이벤트 필터 (전체화면에서만)
+            self._set_global_filter(True)
+
+            # 중앙 X 버튼 준비
+            self._layout_immersive_close()
+            self._hide_immersive_close(force=True)  # 기본은 숨김
+
+            self.showFullScreen()
+            self.raise_()
+            self.btn_imm_close.raise_()
+            QTimer.singleShot(0, self._layout_immersive_close)
+        else:
+            # 필터/타이머/버튼 정리
+            self._set_global_filter(False)
+            try:
+                self._immersive_hide_timer.stop()
+            except Exception:
+                pass
+            self._hide_immersive_close(force=True)
+
+            # UI 복구
+            self.setWindowFlag(Qt.FramelessWindowHint, False)
+            self.header.setVisible(True)
+            self.statusBar().setVisible(True)
+            self._viewer_layout.setContentsMargins(*self._viewer_margin_norm)
+            self.showNormal()
+
+    # -------- 중앙 X 버튼(바 없이) --------
+    def _init_immersive_close_button(self):
+        # 중앙 X 버튼 (텍스트 대신 아이콘)
+        self.btn_imm_close = QPushButton("", self)
+        self.btn_imm_close.setObjectName("ImmersiveClose")
+        self.btn_imm_close.setVisible(False)
+        self.btn_imm_close.clicked.connect(lambda: self._apply_immersive(False))
+
+        # 크기(완전한 원): 56x56
+        self.btn_imm_close.setFixedSize(56, 56)
+
+        # 하얀 X 아이콘을 직접 그려서 일관된 모양 보장
+        def _make_close_icon(d=26, stroke=3.2, color=QColor("white")) -> QIcon:
+            pm = QPixmap(d, d); pm.fill(Qt.transparent)
+            p = QPainter(pm); p.setRenderHint(QPainter.Antialiasing, True)
+            pen = QPen(color, stroke, Qt.SolidLine, Qt.RoundCap)
+            p.setPen(pen)
+            m = d * 0.28  # 안쪽 여백
+            p.drawLine(m, m, d - m, d - m)
+            p.drawLine(d - m, m, m, d - m)
+            p.end()
+            return QIcon(pm)
+
+        self.btn_imm_close.setIcon(_make_close_icon())
+        self.btn_imm_close.setIconSize(QSize(26, 26))
+
+        # 약간의 그림자(띄워 보이도록)
+        eff = QGraphicsDropShadowEffect(self.btn_imm_close)
+        eff.setBlurRadius(24); eff.setOffset(0, 2); eff.setColor(QColor(0, 0, 0, 140))
+        self.btn_imm_close.setGraphicsEffect(eff)
+
+        # 자동 숨김 타이머(기존 로직 유지)
+        self._immersive_hide_timer = QTimer(self)
+        self._immersive_hide_timer.setSingleShot(True)
+        self._immersive_hide_timer.timeout.connect(self._hide_immersive_close)
+
+        # 마우스 트래킹(자식 포함)
+        self.setMouseTracking(True)
+        cw = self.centralWidget()
+        if cw:
+            self._enable_mouse_tracking_recursive(cw)
+
+
+    def _enable_mouse_tracking_recursive(self, w: QWidget):
+        w.setMouseTracking(True)
+        for ch in w.findChildren(QWidget):
+            ch.setMouseTracking(True)
+
+    def _layout_immersive_close(self):
+        if not hasattr(self, "btn_imm_close"):
+            return
+        btn = self.btn_imm_close
+        btn.adjustSize()
+        bw, bh = btn.width(), btn.height()
+        x = (self.width() - bw) // 2
+        y = 10
+        btn.setGeometry(x, y, bw, bh)
+
+    def _show_immersive_close(self):
+        if getattr(self, "_immersive", False):
+            if not self.btn_imm_close.isVisible():
+                self.btn_imm_close.setVisible(True)
+            self.btn_imm_close.raise_()
+
+    def _hide_immersive_close(self, force: bool = False):
+        if not hasattr(self, "btn_imm_close"):
+            return
+        if force or not self.btn_imm_close.underMouse():
+            self.btn_imm_close.setVisible(False)
+
+    # 전역 이벤트 필터: 상단 10px 접근 시 중앙 X 표시
+    def eventFilter(self, obj, ev):
+        if not getattr(self, "_immersive", False):
+            return super().eventFilter(obj, ev)
+
+        if ev.type() in (QEvent.MouseMove, QEvent.HoverMove):
+            # ✅ 전역 커서 좌표 얻기
+            gp = QCursor.pos()              # <-- QApplication.instance().cursor().pos() 대신
+            p  = self.mapFromGlobal(gp)
+
+            if not self.rect().contains(p):
+                self._immersive_hide_timer.start(300)
+                return super().eventFilter(obj, ev)
+
+            # 상단 10px 접근 시 중앙 X 버튼 표시
+            if p.y() <= 10 and p.x() >= self.width()/2 - 500 and p.x() <= self.width()/2 + 500:
+                self._layout_immersive_close()
+                self._show_immersive_close()
+                self._immersive_hide_timer.start(1800)
+            else:
+                # 버튼 영역 밖이면 잠시 뒤 숨김
+                if not self.btn_imm_close.geometry().contains(p):
+                    self._immersive_hide_timer.start(600)
+
+        return super().eventFilter(obj, ev)

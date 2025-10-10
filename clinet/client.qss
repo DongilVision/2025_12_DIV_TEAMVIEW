@@ -70,3 +70,15 @@ QProgressBar::chunk { background-color: #1173d4; margin: 1px; border-radius: 5px
 /* ===== 연결 다이얼로그 ===== */
 #ConnectDialog { background-color: #101922; }
 #ConnectError  { color: #dc3546; padding-top: 6px; }
+
+#ImmersiveClose {
+  background-color: #51565c;   /* 짙은 회색 원 */
+  color: #ffffff;
+  border: none;
+  border-radius: 28px;         /* 56px/2 → 완전한 원 */
+  min-width: 56px;
+  min-height: 56px;
+  padding: 0;                  /* 아이콘만 표시 */
+}
+#ImmersiveClose:hover   { background-color: #5f656c; }
+#ImmersiveClose:pressed { background-color: #43484e; }
