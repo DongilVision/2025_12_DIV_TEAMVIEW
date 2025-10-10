@@ -95,14 +95,12 @@ class VideoServer(QThread):
                     self.sig_last_client.emit("")
                 self.sig_conn_changed.emit(len(self._clients))
 
+    # ✅ 변경: 반드시 _drop()을 호출해 내부 집합에서 제거 + 시그널 갱신
     def force_disconnect_all(self):
         with self._lock:
             conns = list(self._clients)
         for s in conns:
-            try: s.shutdown(socket.SHUT_RDWR)
-            except Exception: pass
-            try: s.close()
-            except Exception: pass
+            self._drop(s)  # _drop 안에서 close + self._clients 제거 + 시그널 emit
 
     def stop(self): self._stop.set()
 
@@ -115,6 +113,24 @@ class ControlServer(QThread):
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._clients: set[socket.socket] = set()
+
+    def _drop(self, s: socket.socket):
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+        with self._lock:
+            self._clients.discard(s)
+
+    def force_disconnect_all(self):
+        with self._lock:
+            conns = list(self._clients)
+        for s in conns:
+            self._drop(s)
 
     def run(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -34,7 +34,7 @@ class ServerWindow(QMainWindow):
         self.files = FileServer(DEFAULT_HOST, FILE_PORT)
 
         # ===== UI =====
-        title = QLabel("서버 실행 중", alignment=Qt.AlignCenter)
+        title = QLabel("원격 서버 실행 중", alignment=Qt.AlignCenter)
         title.setObjectName("Title")
 
         self.lbl_ip   = QLabel(f"서버 IP: {self.ip}", alignment=Qt.AlignCenter)
@@ -72,7 +72,7 @@ class ServerWindow(QMainWindow):
         v.addWidget(w_top)
         v.addWidget(self.lbl_elapsed)
         v.addWidget(self.lbl_client_ip)
-        v.addWidget(self.lbl_video_count)
+        # v.addWidget(self.lbl_video_count)
 
         wrap = QWidget(); wrap.setLayout(v)
         self.setCentralWidget(wrap)
@@ -93,6 +93,7 @@ class ServerWindow(QMainWindow):
         except Exception: pass
         try: self.ctrl.force_disconnect_all()
         except Exception: pass
+
 
     # ---- 신호 핸들러 ----
     def on_video_conn_changed(self, n: int):
