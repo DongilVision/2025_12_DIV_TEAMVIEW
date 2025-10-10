@@ -697,7 +697,7 @@ class ClientWindow(QMainWindow):
 
         # --- 헤더/배지/버튼 ---
         self.header = TopHeader(self.on_fullscreen, self.toggle_transfer_page, self.on_reconnect, self.on_exit)
-        self.header.update_ip(f"{self.server_ip}: V{VIDEO_PORT} / C{CONTROL_PORT} / F{FILE_PORT}")
+        self.header.update_ip(f"{self.server_ip}")
 
         # --- 페이지: 원격 뷰어 ---
         self.view = ViewerLabel()
@@ -824,7 +824,7 @@ class ClientWindow(QMainWindow):
 
     # ===================== 재연결/종료 =====================
     def on_reconnect(self):
-        self.header.update_ip(f"{self.server_ip}: V{VIDEO_PORT} / C{CONTROL_PORT} / F{FILE_PORT}")
+        self.header.update_ip(f"{self.server_ip}")
         try:
             self.vc.stop()
             self.vc.wait(1000)
