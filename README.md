@@ -50,8 +50,31 @@ PySide6 기반의 실시간 원격화면 공유 프로그램입니다. 서버에
 - MSS (화면 캡처용)
 
 ### 설치
+
+#### 방법 1: requirements.txt 사용 (권장)
+```bash
+# 프로젝트 루트 디렉토리에서 실행
+pip install -r requirements.txt
+```
+
+#### 방법 2: 개별 패키지 설치
 ```bash
 pip install PySide6 opencv-python numpy mss
+```
+
+#### 가상환경 사용 (권장)
+```bash
+# 가상환경 생성
+python -m venv venv
+
+# 가상환경 활성화
+# Windows:
+venv\Scripts\activate
+# Linux/Mac:
+# source venv/bin/activate
+
+# 의존성 설치
+pip install -r requirements.txt
 ```
 
 ### 실행 방법
@@ -113,7 +136,7 @@ python main.py [서버_IP_주소]
 - **타임아웃**: 5초
 - **버퍼 크기**: 자동 조정
 
-## 🐛 문제 해결
+## 🐛 문제 해결 방법
 
 ### 연결 실패
 1. 서버 IP 주소가 올바른지 확인
@@ -143,15 +166,3 @@ python main.py [서버_IP_주소]
 - **멀티스레딩**: 각 기능별 독립적인 스레드
 - **이벤트 기반**: Qt 시그널/슬롯 시스템
 - **모듈화**: 기능별로 분리된 모듈 구조
-
-## 📄 라이선스
-
-이 프로젝트는 개인 및 교육 목적으로 자유롭게 사용할 수 있습니다.
-
-## 🤝 기여
-
-버그 리포트나 기능 제안은 이슈로 등록해 주세요.
-
----
-
-**주의사항**: 이 프로그램은 교육 및 개인 사용 목적으로 제작되었습니다. 상업적 사용 시 관련 법규를 확인하시기 바랍니다.
